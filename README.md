@@ -64,7 +64,20 @@ mblog --help
 Output (actual `--help`):
 
 ```text
+Usage: mblog [OPTIONS] --keystore-path <KEYSTORE_PATH>
 
+Options:
+      --ws <WS>                        [default: ws://127.0.0.1:9944]
+      --keystore-path <KEYSTORE_PATH>  Path to the node's keystore directory. The Aura public key is auto-detected from this
+      --epoch-size <EPOCH_SIZE>        [default: 1200]
+      --lang <LANG>                    Output language for fixed messages: ja|en [default: en] [possible values: ja, en]
+      --tz <TZ>                        Output timezone: "UTC", "local", fixed offset like "+09:00"/"-05:00", or an IANA zone like "Asia/Dubai" (Unix only; uses system tzdata via TZ env) [default: UTC]
+      --color <COLOR>                  Colorize output: auto|always|never [default: auto] [possible values: auto, always, never]
+      --db <DB>                        SQLite DB path [default: ./mblog.db]
+      --no-store                       Do not write to SQLite
+      --watch                          Enable continuous monitoring mode (run forever)
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 ### 2) Save to DB, set output timezone, and enable watch mode
@@ -199,7 +212,20 @@ mblog --help
 出力（実際の `--help`）:
 
 ```text
+使用方法: mblog [OPTIONS] --keystore-path <KEYSTORE_PATH>
 
+オプション:
+      --ws <WS>                        [デフォルト: ws://127.0.0.1:9944]
+      --keystore-path <KEYSTORE_PATH>  ノードのkeystoreディレクトリのパス。Aura公開鍵はここから自動検出されます
+      --epoch-size <EPOCH_SIZE>        [デフォルト: 1200]
+      --lang <LANG>                    固定メッセージの出力言語: ja|en [デフォルト: en] [指定可能な値: ja, en]
+      --tz <TZ>                        出力タイムゾーン: "UTC"、"local"、"+09:00"/"-05:00"のような固定オフセット、または"Asia/Dubai"のようなIANAゾーン（Unixのみ; TZ環境変数経由でシステムのtzdataを使用） [デフォルト: UTC]
+      --color <COLOR>                  出力のカラー化: auto|always|never [デフォルト: auto] [指定可能な値: auto, always, never]
+      --db <DB>                        SQLite DBパス [デフォルト: ./mblog.db]
+      --no-store                       SQLiteに書き込まない
+      --watch                          継続監視モードを有効化（永続的に実行）
+  -h, --help                           ヘルプを表示
+  -V, --version                        バージョンを表示
 ```
 
 ### 2) DB保存、表示タイムゾーン、監視モード
