@@ -90,6 +90,23 @@ mblog \
   --watch
 ```
 
+Example results (may vary depending on time zone settings)
+```
+ Midnight-blocklog - Version: 0.3.0
+--------------------------------------------------------------
+epoch:245508 / start_slot:294609600 / end_slot:294610799
+author=0x52cc8d7dbb573b0fa3ba8e12545affa48313c3e5e0dc0b07515fd52419373360
+
+Your Block Schedule List
+-------------------------
+#1 slot 294609854: 2026-01-06T04:25:24+04:00 (UTC 2026-01-06T00:25:24+00:00)
+Total=1
+
+Waiting for next session... (next_epoch=245509)
+progress [==============                ] 47% (slot 294610168/294610799)
+```
+>If there is no schedule, it will display `No schedule for this session`.
+
 ## Options
 
 - `--ws <WS>`: WS RPC endpoint (optional; default: `ws://127.0.0.1:9944`)
@@ -237,6 +254,24 @@ mblog \
   --tz Asia/Tokyo \
   --watch
 ```
+
+結果の例（タイムゾーン設定により異なります）:
+```
+ Midnight-blocklog - Version: 0.3.0
+--------------------------------------------------------------
+epoch:245508 / start_slot:294609600 / end_slot:294610799
+author=0x52cc8d7dbb573b0fa3ba8e12545affa48313c3e5e0dc0b07515fd52419373360
+
+Your Block Schedule List
+-------------------------
+#1 slot 294609854: 2026-01-06T04:25:24+04:00 (UTC 2026-01-06T00:25:24+00:00)
+Total=1
+
+Waiting for next session... (next_epoch=245509)
+progress [==============                ] 47% (slot 294610168/294610799)
+```
+> スケジュールがない場合は `このセッションにスケジュールはありません`と表示されます。
+
 
 ## オプション
 
