@@ -35,8 +35,8 @@ struct Args {
     #[arg(long, value_enum, default_value = "auto")]
 	    color: ColorMode,
 	    /// SQLite DB path
-	    #[arg(long, required_unless_present = "no_store")]
-	    db: Option<String>,
+	    #[arg(long, default_value = "./mblog.db")]
+	    db: String,
     /// Do not write to SQLite
     #[arg(long)]
     no_store: bool,
@@ -513,11 +513,7 @@ fn main() -> anyhow::Result<()> {
 				let mut conn = if args.no_store {
 					None
 				} else {
-				let db_path = args
-					.db
-					.as_ref()
-					.ok_or_else(|| anyhow!("--db is required unless --no-store is set"))?;
-				let conn = Connection::open(db_path)?;
+				let conn = Connection::open(&args.db)?;
 				ensure_db(&conn)?;
 				Some(conn)
 			};
@@ -658,8 +654,8 @@ fn main() -> anyhow::Result<()> {
 							"epoch={epoch_idx}, authorities={}; {}",
 							auths.len(),
 							i18n.pick(
-								"author not in current authorities; skip.",
-								"author が現在の authorities に含まれていません; スキップします。",
+								"Nothing scheduled for this session.",
+								"このセッションにスケジュールはありません",
 							)
 						);
 					}
