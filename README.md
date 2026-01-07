@@ -9,7 +9,7 @@ This tool **auto-detects the Aura public key** from the node keystore, verifies 
 ## What it does
 
 - Calculates your **assigned Aura slots** in the current epoch (session), displays them, and stores them in SQLite as `schedule`
-- In watch mode (`mblog watch`), tracks the chain and updates the status. It waits until the next session, and at the boundary it calculates and stores the assigned slots for the new epoch.
+- In watch mode (`mblog block --watch`), tracks the chain and updates the status. It waits until the next session, and at the boundary it calculates and stores the assigned slots for the new epoch.
   - `schedule` (planned)
   - `mint` (observed on best head)
   - `finality` (observed on finalized)
@@ -81,6 +81,26 @@ mblog block \
   --watch
 ```
 
+Example results (may vary depending on time zone settings)
+```
+ Midnight-blocklog - Version: 0.3.1
+--------------------------------------------------------------
+epoch:245527 (start_slot:294632400 / end_slot:294633599)
+      author: 0x52cc8d7dbb573b0fa3ba8e12545affa48313c3e5e0dc0b07515fd52419373360
+   ADA Stake: 2816841.654532 ADA (2816841654532 lovelace)
+Registration: true (Registered)
+
+Your Block Schedule List
+-------------------------
+#1 slot 294633422: 2026-01-07T19:42:12+04:00 (UTC 2026-01-07T15:42:12+00:00)
+Total=1
+
+Waiting for next session... (next_epoch=245528)
+progress [============================= ] 99% (slot 294633599/294633599)
+```
+>If there is no schedule, it will display `No schedule for this session`.
+
+
 ### 3) Show stored blocks (SQLite)
 
 ```bash
@@ -93,20 +113,17 @@ mblog log --db /path/to/midnight-dir/mblog.db --epoch 245525
 
 Example results (may vary depending on time zone settings)
 ```
- Midnight-blocklog - Version: 0.3.0
---------------------------------------------------------------
-epoch:245508 / start_slot:294609600 / end_slot:294610799
-author=0x52cc8d7dbb573b0fa3ba8e12545affa48313c3e5e0dc0b07515fd52419373360
+Midnight Block Log
+-------------------
 
-Your Block Schedule List
--------------------------
-#1 slot 294609854: 2026-01-06T04:25:24+04:00 (UTC 2026-01-06T00:25:24+00:00)
-Total=1
-
-Waiting for next session... (next_epoch=245509)
-progress [==============                ] 47% (slot 294610168/294610799)
+epoch: 245528
+|===|==========|==============|===========|===============|===========================|=======================|
+| # | status   | block_number | slot      | slot_in_epoch | Scheduled_time            | block_hash            |
+|===|==========|==============|===========|===============|===========================|=======================|
+| 1 | finality | 3238956      | 294633833 | 233           | 2026-01-07T20:23:18+04:00 | 0xec7a91ac...81f5d053 |
+| 2 | finality | 3238966      | 294633843 | 243           | 2026-01-07T20:24:18+04:00 | 0x63ec2189...c0776574 |
+|===|==========|==============|===========|===============|===========================|=======================|
 ```
->If there is no schedule, it will display `No schedule for this session`.
 
 ## Options
 
@@ -168,7 +185,7 @@ On the first run, an SQLite database is created at the `--db` path you specify, 
 
 
 ## Roadmap
-- Display functionality for block production results (per epoch)
+- Indexer Integration
 - UX improvements (please open an issue if you have a request)
 
 ## License
@@ -190,7 +207,7 @@ Midnightノード向けの **Aura ブロック生成スケジュール表示 + S
 ## できること
 
 - 現在 epoch（session）の **自分の Aura 担当スロット**を計算して表示・SQLite に `schedule` として保存
-- 監視モード（`mblog watch`）でチェーンを追跡し状態を更新。次のセッションまで待機し境界で新しい epoch の担当スロットを計算・保存します。
+- 監視モード（`mblog block --watch`）でチェーンを追跡し状態を更新。次のセッションまで待機し境界で新しい epoch の担当スロットを計算・保存します。
   - `schedule`（予定）
   - `mint`（best head で観測）
   - `finality`（finalized で観測）
@@ -252,44 +269,6 @@ mblog --help
   log    SQLite の blocks 表示
 ```
 
-### 2) スケジュールDB保存、表示タイムゾーン、監視モード有効化
-
-```bash
-mblog block \
-  --keystore-path /path/to/your/keystore \
-  --db /path/to/midnight-dir/mblog.db \
-  --tz Asia/Tokyo \
-  --watch
-```
-
-### 3) blocks 表示（SQLite）
-
-```bash
-# 最新の epoch（デフォルト）
-mblog log --db /path/to/midnight-dir/mblog.db
-
-# epoch 指定
-mblog log --db /path/to/midnight-dir/mblog.db --epoch 245525
-```
-
-結果の例（タイムゾーン設定により異なります）:
-```
- Midnight-blocklog - Version: 0.3.0
---------------------------------------------------------------
-epoch:245508 / start_slot:294609600 / end_slot:294610799
-author=0x52cc8d7dbb573b0fa3ba8e12545affa48313c3e5e0dc0b07515fd52419373360
-
-Your Block Schedule List
--------------------------
-#1 slot 294609854: 2026-01-06T04:25:24+04:00 (UTC 2026-01-06T00:25:24+00:00)
-Total=1
-
-Waiting for next session... (next_epoch=245509)
-progress [==============                ] 47% (slot 294610168/294610799)
-```
-> スケジュールがない場合は `このセッションにスケジュールはありません`と表示されます。
-
-
 ## オプション
 
 サブコマンドごとにオプションが異なります。
@@ -318,6 +297,62 @@ progress [==============                ] 47% (slot 294610168/294610799)
 - `--tz <TZ>`: Scheduled time の表示タイムゾーン（省略可能、デフォルト: `UTC`）
 
 詳細・最新の一覧は `mblog block --help` と `mblog log --help` を参照してください。
+
+
+### 2) スケジュールDB保存、表示タイムゾーン、監視モード有効化
+
+```bash
+mblog block \
+  --keystore-path /path/to/your/keystore \
+  --db /path/to/midnight-dir/mblog.db \
+  --tz Asia/Tokyo \
+  --watch
+```
+
+結果の例（タイムゾーン設定により異なります）:
+```
+ Midnight-blocklog - Version: 0.3.1
+--------------------------------------------------------------
+epoch:245527 (start_slot:294632400 / end_slot:294633599)
+      author: 0x52cc8d7dbb573b0fa3ba8e12545affa48313c3e5e0dc0b07515fd52419373360
+   ADA Stake: 2816841.654532 ADA (2816841654532 lovelace)
+Registration: true (Registered)
+
+Your Block Schedule List
+-------------------------
+#1 slot 294633422: 2026-01-07T19:42:12+04:00 (UTC 2026-01-07T15:42:12+00:00)
+Total=1
+
+Waiting for next session... (next_epoch=245528)
+progress [============================= ] 99% (slot 294633599/294633599)
+```
+> スケジュールがない場合は `このセッションにスケジュールはありません`と表示されます。
+
+
+### 3) blocks 表示（SQLite）
+
+```bash
+# 最新の epoch（デフォルト）
+mblog log --db /path/to/midnight-dir/mblog.db
+
+# epoch 指定
+mblog log --db /path/to/midnight-dir/mblog.db --epoch 245525
+```
+
+結果の例（タイムゾーン設定により異なります）:
+```
+Midnight Block Log
+-------------------
+
+epoch: 245528
+|===|==========|==============|===========|===============|===========================|=======================|
+| # | status   | block_number | slot      | slot_in_epoch | Scheduled_time            | block_hash            |
+|===|==========|==============|===========|===============|===========================|=======================|
+| 1 | finality | 3238956      | 294633833 | 233           | 2026-01-07T20:23:18+04:00 | 0xec7a91ac...81f5d053 |
+| 2 | finality | 3238966      | 294633843 | 243           | 2026-01-07T20:24:18+04:00 | 0x63ec2189...c0776574 |
+|===|==========|==============|===========|===============|===========================|=======================|
+```
+
 
 ## SQLite に保存する内容
 SQLiteに格納されるデータは、当アプリケーションを `mblog block --watch` で実行することで継続的に更新されます。
@@ -350,7 +385,7 @@ SQLiteに格納されるデータは、当アプリケーションを `mblog blo
 
 
 ## 今後の予定
-- ブロック生成実績一覧の表示機能（エポックごと）
+- インデクサー連携
 - UX改善（リクエストがあればissueを提出してください）
 
 ## ライセンス
