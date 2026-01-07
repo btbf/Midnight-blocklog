@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use std::io::IsTerminal;
 use std::io::Write;
@@ -12,11 +12,27 @@ use substrate_api_client::rpc::Request;
 use anyhow::anyhow;
 use chrono::{FixedOffset, Local, Utc};
 use rusqlite::{params, Connection};
+use serde_json::Value;
 use sp_runtime::generic::DigestItem;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Parser)]
 #[command(name = "mblog", version)]
-struct Args {
+struct Cli {
+	#[command(subcommand)]
+	command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+	/// Show Aura slot schedule (use --watch to monitor)
+	Block(CommonArgs),
+	/// Show stored blocks from SQLite
+	Log(BlockArgs),
+}
+
+#[derive(Args)]
+struct CommonArgs {
 	    #[arg(long, default_value = "ws://127.0.0.1:9944")]
 	    ws: String,
 	    /// Path to the node's keystore directory. The Aura public key is auto-detected from this.
@@ -40,9 +56,35 @@ struct Args {
     /// Do not write to SQLite
     #[arg(long)]
     no_store: bool,
-    #[arg(long)]
-    /// Enable continuous monitoring mode (run forever)
-    watch: bool,
+	/// Ariadne (testnet) JSON-RPC endpoint used for validator registration checks
+	#[arg(long, default_value = "https://rpc.testnet-02.midnight.network")]
+	ariadne_endpoint: String,
+	/// Accept invalid TLS certs for Ariadne endpoint (for self-signed endpoints)
+	#[arg(long)]
+	ariadne_insecure: bool,
+	/// Disable validator registration check
+	#[arg(long)]
+	no_registration_check: bool,
+
+	/// Continuously monitor (run forever)
+	#[arg(long)]
+	watch: bool,
+}
+
+#[derive(Args)]
+struct BlockArgs {
+	/// SQLite DB path
+	#[arg(long, default_value = "./mblog.db")]
+	db: String,
+	/// Filter by epoch
+	#[arg(long)]
+	epoch: Option<u64>,
+	/// Display timezone for scheduled time (same format as `mblog slot --tz`)
+	#[arg(long, default_value = "UTC")]
+	tz: String,
+	/// Output language for fixed messages: ja|en
+	#[arg(long, value_enum, default_value = "en")]
+	lang: Lang,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -114,6 +156,14 @@ impl Colors {
 	}
 	fn dim(&self, v: impl AsRef<str>) -> String {
 		self.wrap(v, "90") // bright black
+	}
+
+	fn error(&self, v: impl AsRef<str>) -> String {
+		self.wrap(v, "31") // red
+	}
+
+	fn ok(&self, v: impl AsRef<str>) -> String {
+		self.wrap(v, "32") // green
 	}
 }
 
@@ -444,6 +494,61 @@ fn detect_aura_pubkey_from_keystore(keystore_path: &Path) -> anyhow::Result<Stri
 	}
 }
 
+fn detect_sidechain_pubkey_from_keystore(keystore_path: &Path) -> anyhow::Result<String> {
+	let mut found: Vec<String> = Vec::new();
+
+	for entry in std::fs::read_dir(keystore_path).map_err(|e| {
+		anyhow!(
+			"failed to read --keystore-path '{}' for sidechain key detection: {e}",
+			keystore_path.display()
+		)
+	})? {
+		let entry = entry.map_err(|e| anyhow!("failed to read directory entry: {e}"))?;
+		let file_type = entry.file_type().map_err(|e| anyhow!("failed to stat entry: {e}"))?;
+		if !file_type.is_file() {
+			continue;
+		}
+		let name_os = entry.file_name();
+		let Some(name) = name_os.to_str() else {
+			continue;
+		};
+		let mut hex_name = name.trim().to_ascii_lowercase();
+		if let Some(rest) = hex_name.strip_prefix("0x") {
+			hex_name = rest.to_string();
+		}
+
+		// Expect: <4-byte key type><33-byte compressed pubkey> as hex.
+		// Many sidechain keys are compressed secp256k1 (33 bytes) starting with 02/03.
+		if hex_name.len() != 74 {
+			continue;
+		}
+		let pub_hex = &hex_name[8..];
+		if !pub_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+			continue;
+		}
+		if !(pub_hex.starts_with("02") || pub_hex.starts_with("03")) {
+			continue;
+		}
+		found.push(format!("0x{pub_hex}"));
+	}
+
+	found.sort();
+	found.dedup();
+
+	match found.len() {
+		0 => Err(anyhow!(
+			"no sidechain public key found in keystore '{}': expected a file named like <keytype><33-byte pubkey> (hex, starts with 02/03)",
+			keystore_path.display()
+		)),
+		1 => Ok(found.remove(0)),
+		_ => Err(anyhow!(
+			"multiple sidechain public keys found in keystore '{}': {:?}. Keep only one sidechain key, or use a dedicated keystore path.",
+			keystore_path.display(),
+			found
+		)),
+	}
+}
+
 fn fetch_authorities(
 	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
 ) -> anyhow::Result<Vec<sr25519::Public>> {
@@ -498,9 +603,272 @@ fn compute_my_slots(
 	out
 }
 
-fn main() -> anyhow::Result<()> {
-		    let args = Args::parse();
-		    let i18n = I18n::new(args.lang);
+fn print_kv_table(rows: &[(String, String)]) {
+	let max_w = rows
+		.iter()
+		.map(|(k, _)| UnicodeWidthStr::width(k.as_str()))
+		.max()
+		.unwrap_or(0);
+	for (k, v) in rows {
+		let w = UnicodeWidthStr::width(k.as_str());
+		let pad = max_w.saturating_sub(w);
+		println!("{}{}: {}", " ".repeat(pad), k, v);
+	}
+}
+
+fn abbreviate_middle(s: &str, head: usize, tail: usize) -> String {
+	let s = s.trim();
+	let (prefix, body) = s.strip_prefix("0x").map_or(("", s), |b| ("0x", b));
+	if body.len() <= head + tail {
+		return s.to_string();
+	}
+	format!(
+		"{prefix}{}...{}",
+		&body[..head],
+		&body[body.len() - tail..]
+	)
+}
+
+fn format_rfc3339_in_tz(s: &str, out_tz: &OutputTz) -> String {
+	let s = s.trim();
+	if s.is_empty() || s == "-" {
+		return "-".to_string();
+	}
+	let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) else {
+		return s.to_string();
+	};
+	let dt_utc = dt.with_timezone(&Utc);
+	match out_tz {
+		OutputTz::Utc => dt_utc.to_rfc3339(),
+		OutputTz::Local | OutputTz::ForcedLocal => dt_utc.with_timezone(&Local).to_rfc3339(),
+		OutputTz::Fixed(off) => dt_utc.with_timezone(off).to_rfc3339(),
+	}
+}
+
+fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+	let mut widths: Vec<usize> = headers.iter().map(|h| UnicodeWidthStr::width(*h)).collect();
+	for row in rows {
+		for (i, cell) in row.iter().enumerate() {
+			let w = UnicodeWidthStr::width(cell.as_str());
+			if w > widths[i] {
+				widths[i] = w;
+			}
+		}
+	}
+
+	let border = {
+		let mut s = String::new();
+		s.push('|');
+		for w in &widths {
+			s.push_str(&"=".repeat(*w + 2));
+			s.push('|');
+		}
+		s
+	};
+
+	println!("{border}");
+	println!(
+		"|{}|",
+		headers
+			.iter()
+			.enumerate()
+			.map(|(i, h)| format!(" {:<width$} ", *h, width = widths[i]))
+			.collect::<Vec<_>>()
+			.join("|")
+	);
+	println!("{border}");
+	for row in rows {
+		println!(
+			"|{}|",
+			row.iter()
+				.enumerate()
+				.map(|(i, c)| format!(" {:<width$} ", c, width = widths[i]))
+				.collect::<Vec<_>>()
+				.join("|")
+		);
+	}
+	println!("{border}");
+}
+
+fn run_block(args: BlockArgs) -> anyhow::Result<()> {
+	let conn = Connection::open(&args.db)?;
+	let out_tz = parse_output_tz(&args.tz)?;
+	let i18n = I18n::new(args.lang);
+	let epoch = match args.epoch {
+		Some(e) => e,
+		None => conn
+			.query_row("SELECT MAX(epoch) FROM epoch_info", [], |r| r.get::<_, Option<i64>>(0))
+			.or_else(|_| conn.query_row("SELECT MAX(epoch) FROM blocks", [], |r| r.get::<_, Option<i64>>(0)))?
+			.map(|v| v as u64)
+			.ok_or_else(|| anyhow!("no epoch found in DB (epoch_info/blocks empty)"))?,
+	};
+	let mut stmt = conn.prepare(
+		"SELECT b.slot, b.status, b.block_number, b.block_hash, b.planned_time_utc, e.start_slot \
+		 FROM blocks b LEFT JOIN epoch_info e ON b.epoch = e.epoch \
+		 WHERE b.epoch = ?1 ORDER BY b.slot ASC",
+	)?;
+
+	let mut rows_out: Vec<Vec<String>> = Vec::new();
+	let mut idx: u64 = 0;
+	let mut start_slot: Option<u64> = None;
+
+	let mut rows = stmt.query([epoch as i64])?;
+	while let Some(row) = rows.next()? {
+		idx += 1;
+		let slot: u64 = row.get::<_, i64>(0)? as u64;
+		let status: String = row.get(1)?;
+		let block_number: Option<i64> = row.get(2)?;
+		let block_hash: Option<String> = row.get(3)?;
+		let planned: Option<String> = row.get(4)?;
+		let st: Option<i64> = row.get(5)?;
+		if start_slot.is_none() {
+			start_slot = st.map(|v| v as u64);
+		}
+
+		let slot_in_epoch = start_slot.map(|s| slot.saturating_sub(s));
+		let bn = block_number.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+		let hash = block_hash
+			.map(|h| abbreviate_middle(&h, 8, 8))
+			.unwrap_or_else(|| "-".to_string());
+		let scheduled = planned
+			.as_deref()
+			.map(|s| format_rfc3339_in_tz(s, &out_tz))
+			.unwrap_or_else(|| "-".to_string());
+
+		rows_out.push(vec![
+			idx.to_string(),
+			status,
+			bn,
+			slot.to_string(),
+			slot_in_epoch.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+			scheduled,
+			hash,
+		]);
+	}
+
+	println!("Midnight Block Log");
+	println!("-------------------");
+	println!();
+	println!("epoch: {}", epoch);
+	if rows_out.is_empty() {
+		let msg = i18n.pick(
+			"No block production logs for this epoch.",
+			"このエポックにはブロック生成ログがありません",
+		);
+		eprintln!();
+		if std::io::stdout().is_terminal() {
+			eprintln!("\x1b[31m{msg}\x1b[0m");
+		} else {
+			eprintln!("{msg}");
+		}
+		eprintln!();
+		return Ok(());
+	}
+	print_table(
+		&[
+			"#",
+			"status",
+			"block_number",
+			"slot",
+			"slot_in_epoch",
+			"Scheduled_time",
+			"block_hash",
+		],
+		&rows_out,
+	);
+	println!();
+	Ok(())
+}
+
+fn jsonrpc_http_call(
+	client: &reqwest::blocking::Client,
+	endpoint: &str,
+	method: &str,
+	params: Value,
+) -> anyhow::Result<Value> {
+	let request_body = serde_json::json!({
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": method,
+		"params": params,
+	});
+	let res: Value = client
+		.post(endpoint)
+		.json(&request_body)
+		.send()?
+		.error_for_status()?
+		.json()?;
+	if let Some(err) = res.get("error") {
+		return Err(anyhow!("JSON-RPC error: {}", serde_json::to_string(err)?));
+	}
+	Ok(res
+		.get("result")
+		.cloned()
+		.unwrap_or(Value::Null))
+}
+
+fn parse_lovelace(v: &Value) -> Option<u128> {
+	match v {
+		Value::Number(n) => n.as_u64().map(|u| u as u128),
+		Value::String(s) => s.parse::<u128>().ok(),
+		_ => None,
+	}
+}
+
+fn format_ada_from_lovelace(lovelace: u128) -> String {
+	const UNIT: u128 = 1_000_000;
+	let whole = lovelace / UNIT;
+	let frac = (lovelace % UNIT) as u64;
+	if frac == 0 {
+		return whole.to_string();
+	}
+	let mut frac_s = format!("{frac:06}");
+	while frac_s.ends_with('0') {
+		frac_s.pop();
+	}
+	format!("{whole}.{frac_s}")
+}
+
+fn fetch_registration_status(
+	client: &reqwest::blocking::Client,
+	endpoint: &str,
+	sidechain_pubkey: &str,
+	mainchain_epoch: u64,
+) -> anyhow::Result<(u128, bool)> {
+	let ariadne = jsonrpc_http_call(
+		client,
+		endpoint,
+		"sidechain_getAriadneParameters",
+		Value::Array(vec![Value::Number(mainchain_epoch.into())]),
+	)?;
+
+	let Some(regs) = ariadne
+		.get("candidateRegistrations")
+		.and_then(|v| v.as_object())
+	else {
+		return Ok((0, false));
+	};
+
+	for (_mainchain_pubkey, entries) in regs {
+		let Some(arr) = entries.as_array() else { continue };
+		for entry in arr {
+			let sc = entry.get("sidechainPubKey").and_then(|v| v.as_str());
+			if sc != Some(sidechain_pubkey) {
+				continue;
+			}
+			let stake = entry
+				.get("stakeDelegation")
+				.and_then(parse_lovelace)
+				.unwrap_or(0);
+			let is_valid = entry.get("isValid").and_then(|v| v.as_bool()).unwrap_or(false);
+			return Ok((stake, is_valid));
+		}
+	}
+	Ok((0, false))
+}
+
+fn run(common: CommonArgs) -> anyhow::Result<()> {
+	let i18n = I18n::new(common.lang);
 				println!();
 				println!(
 					" Midnight-blocklog - {}: {}",
@@ -508,23 +876,38 @@ fn main() -> anyhow::Result<()> {
 					env!("CARGO_PKG_VERSION")
 				);
 				println!("--------------------------------------------------------------");
-				let colors = Colors::new(args.color);
+				let colors = Colors::new(common.color);
 				let is_tty = std::io::stdout().is_terminal();
-				let mut conn = if args.no_store {
+				let mut conn = if common.no_store {
 					None
 				} else {
-				let conn = Connection::open(&args.db)?;
+				let conn = Connection::open(&common.db)?;
 				ensure_db(&conn)?;
 				Some(conn)
 			};
 	let author_hex =
-		detect_aura_pubkey_from_keystore(Path::new(&args.keystore_path))?;
+		detect_aura_pubkey_from_keystore(Path::new(&common.keystore_path))?;
 	let author_bytes =
 		parse_pubkey_hex(&author_hex).map_err(|e| anyhow!("invalid aura pubkey from keystore: {e}"))?;
-	let out_tz = parse_output_tz(&args.tz)?;
+	let sidechain_pubkey = if common.no_registration_check {
+		None
+	} else {
+		Some(detect_sidechain_pubkey_from_keystore(Path::new(&common.keystore_path))?)
+	};
+	let ariadne_client = if common.no_registration_check {
+		None
+	} else {
+		Some(
+			reqwest::blocking::Client::builder()
+				.user_agent(format!("mblog/{}", env!("CARGO_PKG_VERSION")))
+				.danger_accept_invalid_certs(common.ariadne_insecure)
+				.build()?,
+		)
+	};
+	let out_tz = parse_output_tz(&common.tz)?;
 	let utc_tz = OutputTz::Utc;
 
-    let client = TungsteniteRpcClient::new(&args.ws, 3)
+    let client = TungsteniteRpcClient::new(&common.ws, 3)
 		.map_err(|e| anyhow!("rpc client init failed: {e:?}"))?;
     let api: Api<DefaultRuntimeConfig, TungsteniteRpcClient> =
 		Api::new(client).map_err(|e| anyhow!("api init failed: {e:?}"))?;
@@ -537,14 +920,13 @@ fn main() -> anyhow::Result<()> {
 		));
 	}
 
-	let epoch_size = args.epoch_size as u64;
+	let epoch_size = common.epoch_size as u64;
 
 	let mut prev_hash: Option<[u8; 32]> = None;
 	let mut prev_len: usize = 0;
 	let mut prev_author_present: Option<bool> = None;
 	let mut prev_my_schedule_hash: Option<[u8; 32]> = None;
 	let mut prev_epoch: Option<u64> = None;
-	let mut printed_identity: bool = false;
 	let mut waiting_notice_printed: bool = false;
 	// Do not backfill from genesis on startup; initialize cursors from the current chain state.
 	let mut last_best_hash: Option<sp_core::H256> = api
@@ -577,13 +959,13 @@ fn main() -> anyhow::Result<()> {
 			}
 			waiting_notice_printed = false;
 				if prev_hash.is_some() {
+					println!();
 					println!(
 						"{} (len {} -> {})",
 						colors.epoch(i18n.pick("authority set changed", "Authorityセットが更新されました")),
 						prev_len,
 						auths.len()
 					);
-					println!();
 				}
 			prev_hash = Some(current_hash);
 			prev_len = auths.len();
@@ -608,39 +990,95 @@ fn main() -> anyhow::Result<()> {
 		// Prefer the real Aura slot from the block digest; timestamp/slot_duration is only a fallback.
 		let latest_slot = aura_slot_from_header(&best_header).unwrap_or_else(|| ts_ms / slot_dur_ms);
 		let best_number: u64 = best_header.number.into();
+		let epoch_idx = latest_slot / epoch_size;
+		let start_slot = epoch_idx * epoch_size;
+		let slots_to_scan = epoch_size;
+		let epoch_end_slot = start_slot + epoch_size.saturating_sub(1);
 
-			let epoch_idx = latest_slot / epoch_size;
-			let start_slot = epoch_idx * epoch_size;
-				let slots_to_scan = epoch_size;
-				let epoch_end_slot = start_slot + epoch_size.saturating_sub(1);
+		let epoch_switched = prev_epoch.is_none() || prev_epoch.unwrap() != epoch_idx;
 
-				let epoch_switched = prev_epoch.is_none() || prev_epoch.unwrap() != epoch_idx;
+		if changed || epoch_switched {
+			if is_tty && waiting_notice_printed {
+				println!();
+			}
+			waiting_notice_printed = false;
 
-					if changed || epoch_switched {
-						if is_tty && waiting_notice_printed {
-							println!();
+			let paren = format!(
+				"({}:{} / {}:{})",
+				i18n.pick("start_slot", "開始スロット"),
+				start_slot,
+				i18n.pick("end_slot", "終了スロット"),
+				epoch_end_slot
+			);
+			println!(
+				"{}:{} {}",
+				i18n.pick("epoch", "エポック"),
+				colors.epoch(epoch_idx.to_string()),
+				colors.dim(paren)
+			);
+
+			if let Some(ref c) = conn {
+				db_upsert_epoch_info(c, epoch_idx, start_slot, epoch_end_slot, &current_hash_hex, auths.len())?;
+			}
+
+			let mut rows: Vec<(String, String)> = Vec::new();
+			rows.push(("author".to_string(), colors.author(&author_hex)));
+
+			if let (Some(sc), Some(http)) = (sidechain_pubkey.as_deref(), ariadne_client.as_ref()) {
+				let status = jsonrpc_http_call(
+					http,
+					&common.ariadne_endpoint,
+					"sidechain_getStatus",
+					Value::Array(vec![]),
+				)
+				.ok();
+
+				let main_epoch = status
+					.as_ref()
+					.and_then(|v| v.get("mainchain"))
+					.and_then(|v| v.get("epoch"))
+					.and_then(|v| v.as_u64());
+
+				if let Some(main_epoch) = main_epoch {
+					match fetch_registration_status(http, &common.ariadne_endpoint, sc, main_epoch) {
+						Ok((lovelace, is_valid)) => {
+							let ada = format_ada_from_lovelace(lovelace);
+							rows.push((
+								i18n.pick("ADA Stake", "ADA委任量").to_string(),
+								format!("{ada} ADA ({lovelace} lovelace)"),
+							));
+							let label = if is_valid {
+								colors.ok(i18n.pick("Registered", "登録済み"))
+							} else {
+								colors.error(i18n.pick("Not registered", "未登録"))
+							};
+							rows.push((
+								i18n.pick("Registration", "登録").to_string(),
+								format!("{is_valid} ({label})"),
+							));
 						}
-						waiting_notice_printed = false;
-							println!(
-								"{}:{} / {}:{} / {}:{}",
-								i18n.pick("epoch", "エポック"),
-								colors.epoch(epoch_idx.to_string()),
-								i18n.pick("start_slot", "開始スロット"),
-								colors.range(start_slot.to_string()),
-								i18n.pick("end_slot", "終了スロット"),
-								colors.range(epoch_end_slot.to_string())
+						Err(e) => {
+							eprintln!(
+								"{}: {}",
+								colors.dim(i18n.pick("registration check failed", "登録チェックに失敗しました")),
+								colors.dim(e.to_string())
+							);
+						}
+					}
+				} else {
+					eprintln!(
+						"{}",
+						colors.dim(i18n.pick(
+							"registration check skipped (failed to read mainchain epoch)",
+							"登録チェックをスキップしました（mainchain epoch を取得できません）",
+						))
 					);
-
-				if let Some(ref c) = conn {
-					db_upsert_epoch_info(c, epoch_idx, start_slot, epoch_end_slot, &current_hash_hex, auths.len())?;
 				}
 			}
 
-			if !printed_identity {
-				printed_identity = true;
-				println!("author={}", colors.author(&author_hex));
-				println!();
-			}
+			print_kv_table(&rows);
+			println!();
+		}
 
 				// (progress is rendered in the waiting section, so it appears under the waiting line)
 		let author_present = author_in_authorities(&author_bytes, &auths);
@@ -651,12 +1089,11 @@ fn main() -> anyhow::Result<()> {
 			if !author_present {
 					if changed || author_present_changed || prev_epoch.is_none() || prev_epoch.unwrap() != epoch_idx {
 						eprintln!(
-							"epoch={epoch_idx}, authorities={}; {}",
-							auths.len(),
-							i18n.pick(
+							"{}",
+							colors.error(i18n.pick(
 								"Nothing scheduled for this session.",
 								"このセッションにスケジュールはありません",
-							)
+							))
 						);
 					}
 				prev_epoch = Some(epoch_idx);
@@ -776,50 +1213,59 @@ fn main() -> anyhow::Result<()> {
 				}
 			}
 
-			if !args.watch {
+			if !common.watch {
 				break;
 			}
-				let next_epoch_start_slot = (epoch_idx + 1) * epoch_size;
-				let delta_slots = next_epoch_start_slot.saturating_sub(latest_slot).max(1);
-				let delta_ms = delta_slots.saturating_mul(slot_dur_ms);
-				let remaining_secs = (delta_ms / 1000).max(1);
 
-					if !waiting_notice_printed {
-						waiting_notice_printed = true;
-						println!();
-						println!(
-							"{} (next_epoch={})",
-							i18n.pick("Waiting for next session...", "次のセッション待ち..."),
-							epoch_idx + 1
-						);
-					}
+			let next_epoch_start_slot = (epoch_idx + 1) * epoch_size;
+			let delta_slots = next_epoch_start_slot.saturating_sub(latest_slot).max(1);
+			let delta_ms = delta_slots.saturating_mul(slot_dur_ms);
+			let remaining_secs = (delta_ms / 1000).max(1);
 
-				// Avoid sleeping for very long periods so we can still react if the node stalls.
-				let sleep_secs = remaining_secs.min(600).max(1);
-				if is_tty {
-					// Update progress line in realtime without extra RPC calls.
-					let slot_dur_ms = slot_dur_ms.max(1);
-					for elapsed in 0..sleep_secs {
-						let est_slot = latest_slot.saturating_add((elapsed * 1000) / slot_dur_ms);
-						let cur = est_slot.saturating_sub(start_slot);
-						let denom = epoch_size.max(1);
-						let pct = ((cur.saturating_mul(100)) / denom).min(100) as u8;
-						// Always redraw once per second so the current slot display advances even if the percentage doesn't.
-							print_progress(
-								true,
-								&colors,
-								i18n.pick("progress", "進捗"),
-								pct,
-								est_slot,
-								epoch_end_slot,
-							);
-							std::thread::sleep(Duration::from_secs(1));
-						}
-				} else {
-					// Non-TTY: keep logs clean, and avoid extra CPU usage.
-					std::thread::sleep(Duration::from_secs(sleep_secs));
-				}
+			if !waiting_notice_printed {
+				waiting_notice_printed = true;
+				println!();
+				println!(
+					"{} (next_epoch={})",
+					i18n.pick("Waiting for next session...", "次のセッション待ち..."),
+					epoch_idx + 1
+				);
 			}
 
-    Ok(())
+			// Avoid sleeping for very long periods so we can still react if the node stalls.
+			let sleep_secs = remaining_secs.min(600).max(1);
+			if is_tty {
+				// Update progress line in realtime without extra RPC calls.
+				let slot_dur_ms = slot_dur_ms.max(1);
+				for elapsed in 0..sleep_secs {
+					let est_slot = latest_slot.saturating_add((elapsed * 1000) / slot_dur_ms);
+					let cur = est_slot.saturating_sub(start_slot);
+					let denom = epoch_size.max(1);
+					let pct = ((cur.saturating_mul(100)) / denom).min(100) as u8;
+					// Always redraw once per second so the current slot display advances even if the percentage doesn't.
+					print_progress(
+						true,
+						&colors,
+						i18n.pick("progress", "進捗"),
+						pct,
+						est_slot,
+						epoch_end_slot,
+					);
+					std::thread::sleep(Duration::from_secs(1));
+				}
+			} else {
+				// Non-TTY: keep logs clean, and avoid extra CPU usage.
+				std::thread::sleep(Duration::from_secs(sleep_secs));
+			}
+		}
+
+	Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+	let cli = Cli::parse();
+	match cli.command {
+		Command::Block(common) => run(common),
+		Command::Log(args) => run_block(args),
+	}
 }
