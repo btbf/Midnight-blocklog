@@ -1531,15 +1531,15 @@ fn fetch_registration_status(
 
 fn run(common: CommonArgs) -> anyhow::Result<()> {
 	let i18n = I18n::new(common.lang);
-				println!();
-				println!(
-					" Midnight-blocklog - {}: {}",
-					i18n.pick("Version", "バージョン"),
-					env!("CARGO_PKG_VERSION")
-				);
-				println!("--------------------------------------------------------------");
-				let colors = Colors::new(common.color);
-				let is_tty = std::io::stdout().is_terminal();
+	let colors = Colors::new(common.color);
+	let is_tty = std::io::stdout().is_terminal();
+	let live_update = common.watch && is_tty;
+	let banner = format!(
+		"\n Midnight-blocklog - {}: {}\n--------------------------------------------------------------\n",
+		i18n.pick("Version", "バージョン"),
+		env!("CARGO_PKG_VERSION")
+	);
+	print!("{banner}");
 				let mut conn = if common.no_store {
 					None
 				} else {
@@ -1672,8 +1672,17 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 			|| prev_hash.unwrap() != current_hash
 			|| prev_len != auths.len();
 
+		let mut screen_cleared = false;
+		if live_update && changed {
+			// Re-render the whole screen so output doesn't keep appending (TTY + --watch).
+			print!("\r\x1b[2K\x1b[2J\x1b[H{banner}");
+			let _ = std::io::stdout().flush();
+			waiting_notice_printed = false;
+			screen_cleared = true;
+		}
+
 		if changed {
-			if is_tty && waiting_notice_printed {
+			if !live_update && is_tty && waiting_notice_printed {
 				println!();
 			}
 			waiting_notice_printed = false;
@@ -1720,8 +1729,15 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 			pending_next_committee_print = true;
 		}
 
+		if live_update && (changed || epoch_switched) && !screen_cleared {
+			// Clear before printing the new session/epoch section.
+			print!("\r\x1b[2K\x1b[2J\x1b[H{banner}");
+			let _ = std::io::stdout().flush();
+			waiting_notice_printed = false;
+		}
+
 		if changed || epoch_switched {
-			if is_tty && waiting_notice_printed {
+			if !live_update && is_tty && waiting_notice_printed {
 				println!();
 			}
 			waiting_notice_printed = false;
@@ -1848,7 +1864,7 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 					let epoch_changed = epoch_switched;
 
 							if my_changed || epoch_changed {
-								if is_tty && waiting_notice_printed {
+								if !live_update && is_tty && waiting_notice_printed {
 									println!();
 								}
 								waiting_notice_printed = false;
