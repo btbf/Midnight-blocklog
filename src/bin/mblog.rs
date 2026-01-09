@@ -4,6 +4,8 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::{path::Path, time::Duration};
 use substrate_api_client::{
+	ac_node_api::storage::GetStorageTypes,
+	ac_node_api::DecodeAsType,
 	ac_primitives::{sr25519, DefaultRuntimeConfig},
 	rpc::TungsteniteRpcClient,
 	Api, GetChainInfo, GetStorage,
@@ -12,7 +14,9 @@ use substrate_api_client::rpc::Request;
 use anyhow::anyhow;
 use chrono::{FixedOffset, Local, Utc};
 use rusqlite::{params, Connection};
+use scale_value::{Composite, Primitive, Value as ScaleValue, ValueDef, Variant};
 use serde_json::Value;
+use sp_core::crypto::{AccountId32, KeyTypeId};
 use sp_runtime::generic::DigestItem;
 use unicode_width::UnicodeWidthStr;
 
@@ -69,6 +73,42 @@ struct CommonArgs {
 	/// Continuously monitor (run forever)
 	#[arg(long)]
 	watch: bool,
+
+	/// Print metadata / storage availability diagnostics for Session-related items
+	#[arg(long, hide = true)]
+	debug_metadata: bool,
+
+	/// Print pallet names from runtime metadata (optional filter)
+	#[arg(long, hide = true)]
+	debug_pallets: bool,
+
+	/// Filter for --debug-pallets (case-insensitive substring)
+	#[arg(long, hide = true)]
+	debug_pallet_filter: Option<String>,
+
+	/// List storage entry names/types for a pallet: --debug-storage-list <PALLET>
+	#[arg(long, hide = true, value_name = "PALLET")]
+	debug_storage_list: Option<String>,
+
+	/// Filter for --debug-storage-list (case-insensitive substring)
+	#[arg(long, hide = true)]
+	debug_storage_filter: Option<String>,
+
+	/// Decode a plain storage item using metadata: --debug-decode-storage <PALLET> <ITEM>
+	#[arg(long, hide = true, num_args = 2, value_names = ["PALLET", "ITEM"])]
+	debug_decode_storage: Option<Vec<String>>,
+
+	/// Max nesting depth for --debug-decode-storage
+	#[arg(long, hide = true, default_value_t = 8)]
+	debug_decode_max_depth: usize,
+
+	/// Max items per collection for --debug-decode-storage
+	#[arg(long, hide = true, default_value_t = 10)]
+	debug_decode_max_items: usize,
+
+	/// Read a plain storage item by name: --debug-storage <PALLET> <ITEM>
+	#[arg(long, hide = true, num_args = 2, value_names = ["PALLET", "ITEM"])]
+	debug_storage: Option<Vec<String>>,
 }
 
 #[derive(Args)]
@@ -558,6 +598,643 @@ fn fetch_authorities(
 	Ok(res.unwrap_or_default())
 }
 
+fn format_meta_check(res: Result<(), anyhow::Error>) -> String {
+	match res {
+		Ok(()) => "ok".to_string(),
+		Err(e) => format!("err: {e}"),
+	}
+}
+
+fn hex_bytes_abbrev(bytes: &[u8], max_hex_chars: usize) -> String {
+	let h = hex::encode(bytes);
+	if h.len() <= max_hex_chars {
+		return format!("0x{h}");
+	}
+	format!("0x{}...{}", &h[..max_hex_chars], &h[h.len().saturating_sub(32)..])
+}
+
+fn extract_plain_type_id(ty_dbg: &str) -> Option<u32> {
+	let pat = "Plain(UntrackedSymbol { id: ";
+	let Some(rest) = ty_dbg.strip_prefix(pat) else { return None };
+	let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+	n.parse::<u32>().ok()
+}
+
+fn print_pallets(api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>, filter: Option<&str>) {
+	let filter_lc = filter.map(|s| s.to_lowercase());
+	for p in api.metadata().pallets() {
+		let name = p.name();
+		if let Some(ref f) = filter_lc {
+			if !name.to_lowercase().contains(f) {
+				continue;
+			}
+		}
+		let storage_len = p.storage().len();
+		println!("{name} (index={}, storage={storage_len})", p.index());
+	}
+}
+
+fn debug_read_plain_storage(
+	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
+	pallet_name: &str,
+	item_name: &str,
+) {
+	let Some(pallet) = api.metadata().pallet_by_name(pallet_name) else {
+		eprintln!("debug-storage: pallet not found: {pallet_name}");
+		return;
+	};
+	let Some(entry) = pallet.storage().find(|e| e.name == item_name) else {
+		eprintln!("debug-storage: storage item not found: {pallet_name}.{item_name}");
+		return;
+	};
+
+	let Ok(val) = entry.get_value(pallet_name) else {
+		eprintln!(
+			"debug-storage: {pallet_name}.{item_name} is not a plain value storage (ty={:?})",
+			entry.ty
+		);
+		return;
+	};
+
+	let ty_dbg = format!("{:?}", entry.ty);
+	if let Some(type_id) = extract_plain_type_id(&ty_dbg) {
+		let type_path = api
+			.metadata()
+			.resolve_type(type_id)
+			.map(|t| t.path.to_string())
+			.filter(|s| !s.is_empty())
+			.unwrap_or_else(|| "<unknown>".to_string());
+		println!("debug-storage: type=Plain(id={type_id}, path={type_path})");
+	}
+
+	let key = val.key();
+	println!("debug-storage: key=0x{}", hex::encode(&key.0));
+	match api.get_opaque_storage_by_key(key, None) {
+		Ok(Some(raw)) => {
+			println!(
+				"debug-storage: value_bytes={} {}",
+				raw.len(),
+				hex_bytes_abbrev(&raw, 256)
+			);
+		}
+		Ok(None) => println!("debug-storage: value=null"),
+		Err(e) => eprintln!("debug-storage: read error: {e:?}"),
+	}
+}
+
+fn summarize_primitive(p: &Primitive) -> String {
+	match p {
+		Primitive::Bool(b) => b.to_string(),
+		Primitive::Char(c) => c.to_string(),
+		Primitive::String(s) => {
+			if s.len() <= 120 {
+				format!("{s:?}")
+			} else {
+				format!("{:?}...", &s[..120])
+			}
+		}
+		Primitive::U128(n) => n.to_string(),
+		Primitive::I128(n) => n.to_string(),
+		Primitive::U256(b) | Primitive::I256(b) => format!("0x{}", hex::encode(b)),
+	}
+}
+
+fn value_as_u64(v: &ScaleValue<()>) -> Option<u64> {
+	match &v.value {
+		ValueDef::Primitive(Primitive::U128(n)) => (*n).try_into().ok(),
+		_ => None,
+	}
+}
+
+fn value_as_unnamed(v: &ScaleValue<()>) -> Option<&[ScaleValue<()>]> {
+	match &v.value {
+		ValueDef::Composite(Composite::Unnamed(values)) => Some(values),
+		_ => None,
+	}
+}
+
+fn value_as_named(v: &ScaleValue<()>) -> Option<&[(String, ScaleValue<()>)]> {
+	match &v.value {
+		ValueDef::Composite(Composite::Named(values)) => Some(values),
+		_ => None,
+	}
+}
+
+fn value_as_bytes(v: &ScaleValue<()>) -> Option<Vec<u8>> {
+	let items = value_as_unnamed(v)?;
+	let mut out = Vec::with_capacity(items.len());
+	for it in items {
+		let Some(b) = value_as_u64(it) else { return None };
+		let b: u8 = b.try_into().ok()?;
+		out.push(b);
+	}
+	Some(out)
+}
+
+fn value_as_wrapped_bytes(v: &ScaleValue<()>) -> Option<Vec<u8>> {
+	// Many values appear as Composite::Unnamed(len=1) -> Composite::Unnamed(len=N) -> [u8...]
+	let items = value_as_unnamed(v)?;
+	if items.len() != 1 {
+		return None;
+	}
+	value_as_bytes(&items[0])
+}
+
+fn value_as_wrapped_u64(v: &ScaleValue<()>) -> Option<u64> {
+	let items = value_as_unnamed(v)?;
+	if items.len() != 1 {
+		return None;
+	}
+	value_as_u64(&items[0])
+}
+
+fn hex0x(bytes: &[u8]) -> String {
+	format!("0x{}", hex::encode(bytes))
+}
+
+fn debug_pretty_committee_info(v: &ScaleValue<()>, max_items: usize) -> Option<Vec<String>> {
+	// Expected shape:
+	// Composite::Named { epoch: (u64), committee: [slot -> (sidechain_pub_key(33), {aura(32), grandpa(32)})] }
+	let named = value_as_named(v)?;
+	let epoch_v = named.iter().find(|(k, _)| k == "epoch")?.1.clone();
+	let committee_v = named.iter().find(|(k, _)| k == "committee")?.1.clone();
+
+	let epoch = value_as_wrapped_u64(&epoch_v)?;
+	let committee_outer = value_as_unnamed(&committee_v)?;
+	if committee_outer.len() != 1 {
+		return None;
+	}
+	let schedule = value_as_unnamed(&committee_outer[0])?;
+
+	let mut out = Vec::new();
+	out.push(format!("CommitteeInfo(epoch={epoch}, slots={})", schedule.len()));
+
+	let mut shown = 0usize;
+	for (idx, entry) in schedule.iter().enumerate() {
+		if shown >= max_items {
+			break;
+		}
+		let parts = value_as_unnamed(entry)?;
+		if parts.len() != 2 {
+			continue;
+		}
+		let sidechain = value_as_wrapped_bytes(&parts[0])?;
+		let keys_named = value_as_named(&parts[1])?;
+		let aura_v = keys_named.iter().find(|(k, _)| k == "aura")?.1.clone();
+		let grandpa_v = keys_named.iter().find(|(k, _)| k == "grandpa")?.1.clone();
+		let aura = value_as_wrapped_bytes(&aura_v)?;
+		let grandpa = value_as_wrapped_bytes(&grandpa_v)?;
+
+		out.push(format!(
+			"  slot[{idx}]: sidechain={} aura={} grandpa={}",
+			hex0x(&sidechain),
+			hex0x(&aura),
+			hex0x(&grandpa)
+		));
+		shown += 1;
+	}
+
+	if schedule.len() > shown {
+		out.push(format!("  ... ({} more)", schedule.len().saturating_sub(shown)));
+	}
+	Some(out)
+}
+
+fn fetch_committee_info(
+	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
+	pallet_name: &str,
+	item_name: &str,
+) -> anyhow::Result<Option<(u64, Vec<([u8; 32], [u8; 32])>)>> {
+	let Some(pallet) = api.metadata().pallet_by_name(pallet_name) else {
+		return Ok(None);
+	};
+	let Some(entry) = pallet.storage().find(|e| e.name == item_name) else {
+		return Ok(None);
+	};
+	let ty_dbg = format!("{:?}", entry.ty);
+	let Some(type_id) = extract_plain_type_id(&ty_dbg) else {
+		return Ok(None);
+	};
+	let Ok(val) = entry.get_value(pallet_name) else {
+		return Ok(None);
+	};
+	let key = val.key();
+	let raw = match api.get_opaque_storage_by_key(key, None) {
+		Ok(Some(b)) => b,
+		Ok(None) => return Ok(None),
+		Err(e) => return Err(anyhow!("{e:?}")),
+	};
+	let v = ScaleValue::<()>::decode_as_type(&mut raw.as_slice(), type_id, api.metadata().types())
+		.map_err(|e| anyhow!("{e}"))?;
+
+	let named = value_as_named(&v).ok_or_else(|| anyhow!("CommitteeInfo decode: expected named composite"))?;
+	let epoch_v = named
+		.iter()
+		.find(|(k, _)| k == "epoch")
+		.ok_or_else(|| anyhow!("CommitteeInfo decode: missing epoch"))?
+		.1
+		.clone();
+	let committee_v = named
+		.iter()
+		.find(|(k, _)| k == "committee")
+		.ok_or_else(|| anyhow!("CommitteeInfo decode: missing committee"))?
+		.1
+		.clone();
+
+	let epoch = value_as_wrapped_u64(&epoch_v).ok_or_else(|| anyhow!("CommitteeInfo decode: epoch"))?;
+
+	let committee_outer = value_as_unnamed(&committee_v).ok_or_else(|| anyhow!("CommitteeInfo decode: committee outer"))?;
+	if committee_outer.len() != 1 {
+		return Err(anyhow!(
+			"CommitteeInfo decode: expected committee outer len=1, got {}",
+			committee_outer.len()
+		));
+	}
+	let schedule = value_as_unnamed(&committee_outer[0]).ok_or_else(|| anyhow!("CommitteeInfo decode: schedule"))?;
+
+	let mut out: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(schedule.len());
+	for entry in schedule {
+		let parts = value_as_unnamed(entry).ok_or_else(|| anyhow!("CommitteeInfo decode: entry parts"))?;
+		if parts.len() != 2 {
+			return Err(anyhow!("CommitteeInfo decode: expected entry len=2, got {}", parts.len()));
+		}
+		let keys_named =
+			value_as_named(&parts[1]).ok_or_else(|| anyhow!("CommitteeInfo decode: keys named"))?;
+		let aura_v = keys_named
+			.iter()
+			.find(|(k, _)| k == "aura")
+			.ok_or_else(|| anyhow!("CommitteeInfo decode: missing aura"))?
+			.1
+			.clone();
+		let grandpa_v = keys_named
+			.iter()
+			.find(|(k, _)| k == "grandpa")
+			.ok_or_else(|| anyhow!("CommitteeInfo decode: missing grandpa"))?
+			.1
+			.clone();
+		let aura_bytes =
+			value_as_wrapped_bytes(&aura_v).ok_or_else(|| anyhow!("CommitteeInfo decode: aura bytes"))?;
+		let grandpa_bytes = value_as_wrapped_bytes(&grandpa_v)
+			.ok_or_else(|| anyhow!("CommitteeInfo decode: grandpa bytes"))?;
+		let aura_len = aura_bytes.len();
+		let aura_arr: [u8; 32] = aura_bytes
+			.try_into()
+			.map_err(|_| anyhow!("CommitteeInfo decode: aura len={aura_len}"))?;
+		let grandpa_len = grandpa_bytes.len();
+		let grandpa_arr: [u8; 32] = grandpa_bytes
+			.try_into()
+			.map_err(|_| anyhow!("CommitteeInfo decode: grandpa len={grandpa_len}"))?;
+		out.push((aura_arr, grandpa_arr));
+	}
+
+	Ok(Some((epoch, out)))
+}
+
+fn print_next_committee_for_author(
+	i18n: &I18n,
+	colors: &Colors,
+	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
+	author_bytes: &[u8; 32],
+	latest_slot: u64,
+	ts_ms: u64,
+	slot_dur_ms: u64,
+	next_start_slot: u64,
+	out_tz: &OutputTz,
+	utc_tz: &OutputTz,
+) {
+	let res = fetch_committee_info(api, "SessionCommitteeManagement", "NextCommittee");
+	let (next_epoch, schedule) = match res {
+		Ok(Some(v)) => v,
+		Ok(None) => {
+			println!(
+				"{}",
+				colors.dim(i18n.pick(
+					"Next committee is not available on this runtime.",
+					"次エポックの委員会情報はこのランタイムでは取得できません。",
+				))
+			);
+			return;
+		}
+		Err(e) => {
+			println!(
+				"{}: {}",
+				colors.dim(i18n.pick(
+					"Next committee read failed",
+					"次エポックの委員会情報の取得に失敗しました",
+				)),
+				colors.dim(e.to_string())
+			);
+			return;
+		}
+	};
+
+	let mut my: Vec<u64> = Vec::new();
+	for (i, (aura, _grandpa)) in schedule.iter().enumerate() {
+		if aura == author_bytes {
+			my.push(next_start_slot + (i as u64));
+		}
+	}
+
+	println!(
+		"{}: {}",
+		i18n.pick("Next epoch schedule", "次のエポックスケジュール"),
+		colors.epoch(next_epoch.to_string())
+	);
+	println!("-------------------------");
+
+	if my.is_empty() {
+		println!("{}", colors.dim(i18n.pick("No assignment in next epoch.", "次エポックの割当はありません。")));
+		return;
+	}
+
+	for (idx, slot) in my.iter().enumerate() {
+		let delta_slots = *slot as i64 - latest_slot as i64;
+		let ts = ts_ms as i64 + (delta_slots * slot_dur_ms as i64);
+		let out_ts = colors.time(format_ts(ts, out_tz));
+		let utc_ts = format_ts(ts, utc_tz);
+		println!(
+			"#{} slot {}: {} (UTC {})",
+			idx + 1,
+			colors.slot(slot.to_string()),
+			out_ts,
+			colors.dim(utc_ts)
+		);
+	}
+	println!("{}={}", i18n.pick("Total", "合計"), my.len());
+}
+
+fn summarize_value_lines(
+	v: &ScaleValue<()>,
+	depth: usize,
+	indent: usize,
+	max_depth: usize,
+	max_items: usize,
+) -> Vec<String> {
+	let pad = " ".repeat(indent);
+	match &v.value {
+		ValueDef::Primitive(p) => vec![format!("{pad}{}", summarize_primitive(p))],
+		ValueDef::BitSequence(bits) => vec![format!("{pad}bits(len={})", bits.len())],
+		ValueDef::Variant(Variant { name, values }) => {
+			let mut out = vec![format!("{pad}Variant({name})")];
+			if depth >= max_depth {
+				out.push(format!("{pad}  ..."));
+				return out;
+			}
+			out.extend(summarize_composite_lines(
+				values,
+				depth + 1,
+				indent + 2,
+				max_depth,
+				max_items,
+			));
+			out
+		}
+		ValueDef::Composite(c) => summarize_composite_lines(c, depth, indent, max_depth, max_items),
+	}
+}
+
+fn summarize_composite_lines(
+	c: &Composite<()>,
+	depth: usize,
+	indent: usize,
+	max_depth: usize,
+	max_items: usize,
+) -> Vec<String> {
+	let pad = " ".repeat(indent);
+	match c {
+		Composite::Named(fields) => {
+			let mut out = vec![format!("{pad}Composite::Named(len={})", fields.len())];
+			if depth >= max_depth {
+				out.push(format!("{pad}  ..."));
+				return out;
+			}
+			for (idx, (k, v)) in fields.iter().enumerate() {
+				if idx >= max_items {
+					out.push(format!("{pad}  ... ({} more)", fields.len().saturating_sub(max_items)));
+					break;
+				}
+				let mut lines = summarize_value_lines(v, depth + 1, indent + 4, max_depth, max_items);
+				if let Some(first) = lines.first_mut() {
+					*first = format!("{pad}  {k}: {}", first.trim_start());
+				}
+				out.extend(lines);
+			}
+			out
+		}
+		Composite::Unnamed(values) => {
+			let mut out = vec![format!("{pad}Composite::Unnamed(len={})", values.len())];
+			if depth >= max_depth {
+				out.push(format!("{pad}  ..."));
+				return out;
+			}
+			for (idx, v) in values.iter().enumerate() {
+				if idx >= max_items {
+					out.push(format!("{pad}  ... ({} more)", values.len().saturating_sub(max_items)));
+					break;
+				}
+				let mut lines = summarize_value_lines(v, depth + 1, indent + 4, max_depth, max_items);
+				if let Some(first) = lines.first_mut() {
+					*first = format!("{pad}  [{idx}]: {}", first.trim_start());
+				}
+				out.extend(lines);
+			}
+			out
+		}
+	}
+}
+
+fn debug_decode_plain_storage(
+	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
+	pallet_name: &str,
+	item_name: &str,
+	max_depth: usize,
+	max_items: usize,
+) {
+	let Some(pallet) = api.metadata().pallet_by_name(pallet_name) else {
+		eprintln!("debug-decode-storage: pallet not found: {pallet_name}");
+		return;
+	};
+	let Some(entry) = pallet.storage().find(|e| e.name == item_name) else {
+		eprintln!("debug-decode-storage: storage item not found: {pallet_name}.{item_name}");
+		return;
+	};
+	let ty_dbg = format!("{:?}", entry.ty);
+	let Some(type_id) = extract_plain_type_id(&ty_dbg) else {
+		eprintln!("debug-decode-storage: storage is not Plain: {ty_dbg}");
+		return;
+	};
+	let type_path = api
+		.metadata()
+		.resolve_type(type_id)
+		.map(|t| t.path.to_string())
+		.filter(|s| !s.is_empty())
+		.unwrap_or_else(|| "<unknown>".to_string());
+
+	let Ok(val) = entry.get_value(pallet_name) else {
+		eprintln!("debug-decode-storage: {pallet_name}.{item_name} is not a plain value storage");
+		return;
+	};
+	let key = val.key();
+	let raw = match api.get_opaque_storage_by_key(key, None) {
+		Ok(Some(b)) => b,
+		Ok(None) => {
+			println!("debug-decode-storage: value=null");
+			return;
+		}
+		Err(e) => {
+			eprintln!("debug-decode-storage: read error: {e:?}");
+			return;
+		}
+	};
+
+	println!("debug-decode-storage: type=Plain(id={type_id}, path={type_path})");
+	match ScaleValue::<()>::decode_as_type(&mut raw.as_slice(), type_id, api.metadata().types()) {
+		Ok(v) => {
+			println!("debug-decode-storage: decoded (summary)");
+			if type_path == "pallet_session_validator_management::pallet::CommitteeInfo" {
+				if let Some(lines) = debug_pretty_committee_info(&v, max_items) {
+					for line in lines {
+						println!("{line}");
+					}
+					return;
+				}
+			}
+			for line in summarize_value_lines(&v, 0, 0, max_depth, max_items) {
+				println!("{line}");
+			}
+		}
+		Err(e) => {
+			eprintln!("debug-decode-storage: decode error: {e}");
+		}
+	}
+}
+
+fn debug_list_storage(
+	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
+	pallet_name: &str,
+	filter: Option<&str>,
+) {
+	let Some(pallet) = api.metadata().pallet_by_name(pallet_name) else {
+		eprintln!("debug-storage-list: pallet not found: {pallet_name}");
+		return;
+	};
+
+	let filter_lc = filter.map(|s| s.to_lowercase());
+	println!("{pallet_name} storage entries");
+	println!("---------------------");
+	for entry in pallet.storage() {
+		let name = entry.name.as_str();
+		if let Some(ref f) = filter_lc {
+			if !name.to_lowercase().contains(f) {
+				continue;
+			}
+		}
+		let ty_dbg = format!("{:?}", entry.ty);
+		if let Some(type_id) = extract_plain_type_id(&ty_dbg) {
+			let type_path = api
+				.metadata()
+				.resolve_type(type_id)
+				.map(|t| t.path.to_string())
+				.filter(|s| !s.is_empty())
+				.unwrap_or_else(|| "<unknown>".to_string());
+			println!("{name}: Plain(id={type_id}, path={type_path})");
+		} else {
+			println!("{name}: {ty_dbg}");
+		}
+	}
+}
+
+fn debug_session_metadata(
+	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
+	author_bytes: &[u8; 32],
+) -> Vec<(String, String)> {
+	let mut rows = Vec::new();
+
+	rows.push((
+		"meta Session pallet".to_string(),
+		if api.metadata().pallet_by_name("Session").is_some() {
+			"present".to_string()
+		} else {
+			"missing".to_string()
+		},
+	));
+
+	let check = |pallet: &'static str, item: &'static str| -> Result<(), anyhow::Error> {
+		api.metadata()
+			.storage_value_key(pallet, item)
+			.map(|_| ())
+			.map_err(|e| anyhow!("{e:?}"))
+	};
+	let check_map = |pallet: &'static str, item: &'static str| -> Result<(), anyhow::Error> {
+		api.metadata()
+			.storage_map_key_prefix(pallet, item)
+			.map(|_| ())
+			.map_err(|e| anyhow!("{e:?}"))
+	};
+	let check_double_prefix =
+		|pallet: &'static str, item: &'static str, first: KeyTypeId| -> Result<(), anyhow::Error> {
+			api.metadata()
+				.storage_double_map_key_prefix(pallet, item, first)
+				.map(|_| ())
+				.map_err(|e| anyhow!("{e:?}"))
+		};
+
+	rows.push((
+		"meta Session.Validators".to_string(),
+		format_meta_check(check("Session", "Validators")),
+	));
+	rows.push((
+		"meta Session.QueuedValidators".to_string(),
+		format_meta_check(check("Session", "QueuedValidators")),
+	));
+	rows.push((
+		"meta Session.QueuedKeys".to_string(),
+		format_meta_check(check("Session", "QueuedKeys")),
+	));
+	rows.push((
+		"meta Session.NextKeys(map)".to_string(),
+		format_meta_check(check_map("Session", "NextKeys")),
+	));
+	rows.push((
+		"meta Session.KeyOwner(dbl)".to_string(),
+		format_meta_check(check_double_prefix("Session", "KeyOwner", KeyTypeId(*b"aura"))),
+	));
+
+	// State checks (do not swallow errors)
+	match api.get_storage::<Vec<AccountId32>>("Session", "Validators", None) {
+		Ok(Some(vs)) => rows.push(("state Session.Validators".to_string(), format!("len={}", vs.len()))),
+		Ok(None) => rows.push(("state Session.Validators".to_string(), "null".to_string())),
+		Err(e) => rows.push(("state Session.Validators".to_string(), format!("err: {e:?}"))),
+	}
+	match api.get_storage::<Vec<AccountId32>>("Session", "QueuedValidators", None) {
+		Ok(Some(vs)) => rows.push((
+			"state Session.QueuedValidators".to_string(),
+			format!("len={}", vs.len()),
+		)),
+		Ok(None) => rows.push(("state Session.QueuedValidators".to_string(), "null".to_string())),
+		Err(e) => rows.push(("state Session.QueuedValidators".to_string(), format!("err: {e:?}"))),
+	}
+
+	let key_type = KeyTypeId(*b"aura");
+	let pubkey = author_bytes.to_vec();
+	match api.get_storage_double_map::<KeyTypeId, Vec<u8>, AccountId32>("Session", "KeyOwner", key_type, pubkey, None)
+	{
+		Ok(Some(a)) => rows.push(("state Session.KeyOwner(aura)".to_string(), hex_account_id32(&a))),
+		Ok(None) => rows.push(("state Session.KeyOwner(aura)".to_string(), "null".to_string())),
+		Err(e) => rows.push(("state Session.KeyOwner(aura)".to_string(), format!("err: {e:?}"))),
+	}
+
+	rows
+}
+
+fn account_id32_bytes(a: &AccountId32) -> &[u8] {
+	<AccountId32 as AsRef<[u8]>>::as_ref(a)
+}
+
+fn hex_account_id32(a: &AccountId32) -> String {
+	format!("0x{}", hex::encode(account_id32_bytes(a)))
+}
+
 fn hash_authorities(auths: &[sr25519::Public]) -> [u8; 32] {
 	let mut hasher = Sha256::new();
 	for a in auths {
@@ -614,19 +1291,6 @@ fn print_kv_table(rows: &[(String, String)]) {
 		let pad = max_w.saturating_sub(w);
 		println!("{}{}: {}", " ".repeat(pad), k, v);
 	}
-}
-
-fn abbreviate_middle(s: &str, head: usize, tail: usize) -> String {
-	let s = s.trim();
-	let (prefix, body) = s.strip_prefix("0x").map_or(("", s), |b| ("0x", b));
-	if body.len() <= head + tail {
-		return s.to_string();
-	}
-	format!(
-		"{prefix}{}...{}",
-		&body[..head],
-		&body[body.len() - tail..]
-	)
 }
 
 fn format_rfc3339_in_tz(s: &str, out_tz: &OutputTz) -> String {
@@ -727,9 +1391,7 @@ fn run_block(args: BlockArgs) -> anyhow::Result<()> {
 
 		let slot_in_epoch = start_slot.map(|s| slot.saturating_sub(s));
 		let bn = block_number.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
-		let hash = block_hash
-			.map(|h| abbreviate_middle(&h, 8, 8))
-			.unwrap_or_else(|| "-".to_string());
+		let hash = block_hash.unwrap_or_else(|| "-".to_string());
 		let scheduled = planned
 			.as_deref()
 			.map(|s| format_rfc3339_in_tz(s, &out_tz))
@@ -927,6 +1589,7 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 	let mut prev_author_present: Option<bool> = None;
 	let mut prev_my_schedule_hash: Option<[u8; 32]> = None;
 	let mut prev_epoch: Option<u64> = None;
+	let mut pending_next_committee_print: bool = true; // also print on first render
 	let mut waiting_notice_printed: bool = false;
 	// Do not backfill from genesis on startup; initialize cursors from the current chain state.
 	let mut last_best_hash: Option<sp_core::H256> = api
@@ -944,6 +1607,62 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 		None => 0,
 	};
 
+	if common.debug_metadata {
+		println!();
+		println!("Session metadata / state diagnostics");
+		println!("----------------------------------");
+		let rows = debug_session_metadata(&api, &author_bytes);
+		print_kv_table(&rows);
+		println!();
+	}
+
+	if common.debug_pallets {
+		println!();
+		println!("Runtime pallets");
+		println!("--------------");
+		print_pallets(&api, common.debug_pallet_filter.as_deref());
+		println!();
+	}
+
+	if let Some(ref pallet_name) = common.debug_storage_list {
+		println!();
+		debug_list_storage(
+			&api,
+			pallet_name,
+			common.debug_storage_filter.as_deref(),
+		);
+		println!();
+	}
+
+	if let Some(ref args) = common.debug_decode_storage {
+		if args.len() == 2 {
+			println!();
+			debug_decode_plain_storage(
+				&api,
+				&args[0],
+				&args[1],
+				common.debug_decode_max_depth,
+				common.debug_decode_max_items,
+			);
+			println!();
+		} else {
+			eprintln!(
+				"debug-decode-storage: expected 2 arguments (<PALLET> <ITEM>), got {}",
+				args.len()
+			);
+		}
+	}
+
+	if let Some(ref args) = common.debug_storage {
+		if args.len() == 2 {
+			println!();
+			debug_read_plain_storage(&api, &args[0], &args[1]);
+			println!();
+		} else {
+			eprintln!("debug-storage: expected 2 arguments (<PALLET> <ITEM>), got {}", args.len());
+		}
+	}
+
 	loop {
 		let auths = fetch_authorities(&api)?;
 		let current_hash = hash_authorities(&auths);
@@ -960,6 +1679,7 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 			waiting_notice_printed = false;
 				if prev_hash.is_some() {
 					println!();
+					println!("--------------------------------------------------------------");
 					println!(
 						"{} (len {} -> {})",
 						colors.epoch(i18n.pick("authority set changed", "Authorityセットが更新されました")),
@@ -996,6 +1716,9 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 		let epoch_end_slot = start_slot + epoch_size.saturating_sub(1);
 
 		let epoch_switched = prev_epoch.is_none() || prev_epoch.unwrap() != epoch_idx;
+		if epoch_switched {
+			pending_next_committee_print = true;
+		}
 
 		if changed || epoch_switched {
 			if is_tty && waiting_notice_printed {
@@ -1023,6 +1746,9 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 
 			let mut rows: Vec<(String, String)> = Vec::new();
 			rows.push(("author".to_string(), colors.author(&author_hex)));
+
+				// NOTE: `--show-next-active-set` is intentionally disabled for now because the target
+				// runtime does not expose the necessary Session storage items.
 
 			if let (Some(sc), Some(http)) = (sidechain_pubkey.as_deref(), ariadne_client.as_ref()) {
 				let status = jsonrpc_http_call(
@@ -1086,21 +1812,39 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 			prev_author_present.is_none() || prev_author_present.unwrap() != author_present;
 		prev_author_present = Some(author_present);
 
-			if !author_present {
-					if changed || author_present_changed || prev_epoch.is_none() || prev_epoch.unwrap() != epoch_idx {
-						eprintln!(
-							"{}",
-							colors.error(i18n.pick(
-								"Nothing scheduled for this session.",
-								"このセッションにスケジュールはありません",
-							))
+				if !author_present {
+						if changed || author_present_changed || prev_epoch.is_none() || prev_epoch.unwrap() != epoch_idx {
+							eprintln!(
+								"{}",
+								colors.error(i18n.pick(
+									"Nothing scheduled for this session.",
+									"このセッションにスケジュールはありません",
+								))
+							);
+						}
+					prev_epoch = Some(epoch_idx);
+					if pending_next_committee_print {
+						pending_next_committee_print = false;
+						println!();
+						// Next epoch committee preview (your assigned slots only)
+						let next_start_slot = (epoch_idx + 1) * epoch_size;
+						print_next_committee_for_author(
+							&i18n,
+							&colors,
+							&api,
+							&author_bytes,
+							latest_slot,
+							ts_ms,
+							slot_dur_ms,
+							next_start_slot,
+							&out_tz,
+							&utc_tz,
 						);
 					}
-				prev_epoch = Some(epoch_idx);
-			} else {
-				let my_slots = compute_my_slots(&auths, &author_bytes, start_slot, slots_to_scan);
-				let my_hash = schedule_hash(&my_slots);
-					let my_changed = prev_my_schedule_hash.is_none() || prev_my_schedule_hash.unwrap() != my_hash;
+				} else {
+					let my_slots = compute_my_slots(&auths, &author_bytes, start_slot, slots_to_scan);
+					let my_hash = schedule_hash(&my_slots);
+						let my_changed = prev_my_schedule_hash.is_none() || prev_my_schedule_hash.unwrap() != my_hash;
 					let epoch_changed = epoch_switched;
 
 							if my_changed || epoch_changed {
@@ -1125,8 +1869,9 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 						db_insert_schedule(c, epoch_idx, &planned)?;
 					}
 						println!(
-							"{}",
-							i18n.pick("Your Block Schedule List", "あなたのブロック生成スケジュール")
+							"{}: {}",
+							i18n.pick("Current epoch Schedule", "現在のエポックのスケジュール"),
+							colors.epoch(epoch_idx.to_string())
 						);
 						println!("-------------------------");
 					for slot in &my_slots {
@@ -1140,10 +1885,28 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 							out_ts,
 							colors.dim(utc_ts)
 						);
+						}
+						println!("{}={}", i18n.pick("Total", "合計"), my_slots.len());
+						if pending_next_committee_print {
+							pending_next_committee_print = false;
+							println!();
+							// Next epoch committee preview (your assigned slots only)
+							let next_start_slot = (epoch_idx + 1) * epoch_size;
+							print_next_committee_for_author(
+								&i18n,
+								&colors,
+								&api,
+								&author_bytes,
+								latest_slot,
+								ts_ms,
+								slot_dur_ms,
+								next_start_slot,
+								&out_tz,
+								&utc_tz,
+							);
+						}
 					}
-					println!("{}={}", i18n.pick("Total", "合計"), my_slots.len());
 				}
-			}
 
 			// Mint detection (best head): when a new head appears and its slot belongs to this author.
 			if last_best_hash.map(|h| h != best_hash).unwrap_or(true) {
