@@ -1,4 +1,5 @@
 /target/
+/target2/
 *.sqlite
 *.db
 .DS_Store

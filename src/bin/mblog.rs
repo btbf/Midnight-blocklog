@@ -1293,19 +1293,6 @@ fn print_kv_table(rows: &[(String, String)]) {
 	}
 }
 
-fn abbreviate_middle(s: &str, head: usize, tail: usize) -> String {
-	let s = s.trim();
-	let (prefix, body) = s.strip_prefix("0x").map_or(("", s), |b| ("0x", b));
-	if body.len() <= head + tail {
-		return s.to_string();
-	}
-	format!(
-		"{prefix}{}...{}",
-		&body[..head],
-		&body[body.len() - tail..]
-	)
-}
-
 fn format_rfc3339_in_tz(s: &str, out_tz: &OutputTz) -> String {
 	let s = s.trim();
 	if s.is_empty() || s == "-" {
@@ -1404,9 +1391,7 @@ fn run_block(args: BlockArgs) -> anyhow::Result<()> {
 
 		let slot_in_epoch = start_slot.map(|s| slot.saturating_sub(s));
 		let bn = block_number.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
-		let hash = block_hash
-			.map(|h| abbreviate_middle(&h, 8, 8))
-			.unwrap_or_else(|| "-".to_string());
+		let hash = block_hash.unwrap_or_else(|| "-".to_string());
 		let scheduled = planned
 			.as_deref()
 			.map(|s| format_rfc3339_in_tz(s, &out_tz))
