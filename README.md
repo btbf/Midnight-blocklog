@@ -72,60 +72,6 @@ Commands:
   log    Show stored blocks from SQLite
 ```
 
-### 2) Schedule DB Save, Display Time Zone, Enable Monitoring Mode
-
-```bash
-mblog block \
-  --keystore-path /path/to/your/keystore \
-  --db /path/to/midnight-dir/mblog.db \
-  --tz Asia/Tokyo \
-  --watch
-```
-
-Example results (may vary depending on time zone settings)
-```
- Midnight-blocklog - Version: 0.3.1
---------------------------------------------------------------
-epoch:245527 (start_slot:294632400 / end_slot:294633599)
-      author: 0x52cc8d7dbb573b0fa3ba8e12545affa48313c3e5e0dc0b07515fd52419373360
-   ADA Stake: 2816841.654532 ADA (2816841654532 lovelace)
-Registration: true (Registered)
-
-Your Block Schedule List
--------------------------
-#1 slot 294633422: 2026-01-07T19:42:12+04:00 (UTC 2026-01-07T15:42:12+00:00)
-Total=1
-
-Waiting for next session... (next_epoch=245528)
-progress [============================= ] 99% (slot 294633599/294633599)
-```
->If there is no schedule, it will display `No schedule for this session`.
-
-
-### 3) Show stored blocks (SQLite)
-
-```bash
-# Latest epoch (default)
-mblog log --db /path/to/midnight-dir/mblog.db
-
-# Specific epoch
-mblog log --db /path/to/midnight-dir/mblog.db --epoch 245525
-```
-
-Example results (may vary depending on time zone settings)
-```
-Midnight Block Log
--------------------
-
-epoch: 245528
-|===|==========|==============|===========|===============|===========================|=======================|
-| # | status   | block_number | slot      | slot_in_epoch | Scheduled_time            | block_hash            |
-|===|==========|==============|===========|===============|===========================|=======================|
-| 1 | finality | 3238956      | 294633833 | 233           | 2026-01-07T20:23:18+04:00 | 0xec7a91ac...81f5d053 |
-| 2 | finality | 3238966      | 294633843 | 243           | 2026-01-07T20:24:18+04:00 | 0x63ec2189...c0776574 |
-|===|==========|==============|===========|===============|===========================|=======================|
-```
-
 ## Options
 
 Options are provided per subcommand.
@@ -158,7 +104,38 @@ Options are provided per subcommand.
 
 See `mblog block --help` and `mblog log --help` for the authoritative list.
 
-### JSON schedule output (stdout)
+
+### 2) Schedule DB Save, Display Time Zone, Enable Monitoring Mode
+
+```bash
+mblog block \
+  --keystore-path /path/to/your/keystore \
+  --db /path/to/midnight-dir/mblog.db \
+  --tz Asia/Tokyo \
+  --watch
+```
+
+Example results (may vary depending on time zone settings)
+```
+ Midnight-blocklog - Version: 0.3.1
+--------------------------------------------------------------
+epoch:245527 (start_slot:294632400 / end_slot:294633599)
+      author: 0x52cc8d7dbb573b0fa3ba8e12545affa48313c3e5e0dc0b07515fd52419373360
+   ADA Stake: 2816841.654532 ADA (2816841654532 lovelace)
+Registration: true (Registered)
+
+Your Block Schedule List
+-------------------------
+#1 slot 294633422: 2026-01-07T19:42:12+04:00 (UTC 2026-01-07T15:42:12+00:00)
+Total=1
+
+Waiting for next session... (next_epoch=245528)
+progress [============================= ] 99% (slot 294633599/294633599)
+```
+>If there is no schedule, it will display `No schedule for this session`.
+
+
+### 3) JSON schedule output (stdout)
 
 When `--output-json` is set (instead of `--watch`), `mblog` prints the schedule as JSON to stdout (`date` respects `--tz`) and exits.  
 Note: `--output-json` does not write to SQLite (it ignores `--db` and does not create/update the DB).
@@ -182,6 +159,30 @@ Sample output:
     { "slot": 294663162, "date": "2026-01-10T12:34:56Z" }
   ]
 }
+```
+
+### 4) Show stored blocks (SQLite)
+
+```bash
+# Latest epoch (default)
+mblog log --db /path/to/midnight-dir/mblog.db
+
+# Specific epoch
+mblog log --db /path/to/midnight-dir/mblog.db --epoch 245525
+```
+
+Example results (may vary depending on time zone settings)
+```
+Midnight Block Log
+-------------------
+
+epoch: 245528
+|===|==========|==============|===========|===============|===========================|=======================|
+| # | status   | block_number | slot      | slot_in_epoch | Scheduled_time            | block_hash            |
+|===|==========|==============|===========|===============|===========================|=======================|
+| 1 | finality | 3238956      | 294633833 | 233           | 2026-01-07T20:23:18+04:00 | 0xec7a91ac...81f5d053 |
+| 2 | finality | 3238966      | 294633843 | 243           | 2026-01-07T20:24:18+04:00 | 0x63ec2189...c0776574 |
+|===|==========|==============|===========|===============|===========================|=======================|
 ```
 
 
@@ -364,31 +365,7 @@ progress [============================= ] 99% (slot 294633599/294633599)
 > スケジュールがない場合は `このセッションにスケジュールはありません`と表示されます。
 
 
-### 3) blocks 表示（SQLite）
-
-```bash
-# 最新の epoch（デフォルト）
-mblog log --db /path/to/midnight-dir/mblog.db
-
-# epoch 指定
-mblog log --db /path/to/midnight-dir/mblog.db --epoch 245525
-```
-
-結果の例（タイムゾーン設定により異なります）:
-```
-Midnight Block Log
--------------------
-
-epoch: 245528
-|===|==========|==============|===========|===============|===========================|=======================|
-| # | status   | block_number | slot      | slot_in_epoch | Scheduled_time            | block_hash            |
-|===|==========|==============|===========|===============|===========================|=======================|
-| 1 | finality | 3238956      | 294633833 | 233           | 2026-01-07T20:23:18+04:00 | 0xec7a91ac...81f5d053 |
-| 2 | finality | 3238966      | 294633843 | 243           | 2026-01-07T20:24:18+04:00 | 0x63ec2189...c0776574 |
-|===|==========|==============|===========|===============|===========================|=======================|
-```
-
-### 4) スケジュールをJSONで出力（stdout）
+### 3) スケジュールをJSONで出力（stdout）
 
 `--watch` の代わりに `--output-json` を指定すると、スケジュールを JSON で標準出力に出力し（`date` は `--tz` を反映）、出力後に終了します。  
 注意: `--output-json` は SQLite には書き込みません（`--db` は無視され、DBの作成/更新も行いません）
@@ -413,7 +390,29 @@ mblog block --keystore-path /path/to/your/keystore --tz UTC --output-json --next
 }
 ```
 
+### 4) blocks 表示（SQLite）
 
+```bash
+# 最新の epoch（デフォルト）
+mblog log --db /path/to/midnight-dir/mblog.db
+
+# epoch 指定
+mblog log --db /path/to/midnight-dir/mblog.db --epoch 245525
+```
+
+結果の例（タイムゾーン設定により異なります）:
+```
+Midnight Block Log
+-------------------
+
+epoch: 245528
+|===|==========|==============|===========|===============|===========================|=======================|
+| # | status   | block_number | slot      | slot_in_epoch | Scheduled_time            | block_hash            |
+|===|==========|==============|===========|===============|===========================|=======================|
+| 1 | finality | 3238956      | 294633833 | 233           | 2026-01-07T20:23:18+04:00 | 0xec7a91ac...81f5d053 |
+| 2 | finality | 3238966      | 294633843 | 243           | 2026-01-07T20:24:18+04:00 | 0x63ec2189...c0776574 |
+|===|==========|==============|===========|===============|===========================|=======================|
+```
 
 
 ## SQLite に保存する内容
