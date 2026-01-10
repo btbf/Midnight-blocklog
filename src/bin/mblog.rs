@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::{path::Path, time::Duration};
@@ -13,7 +14,7 @@ use substrate_api_client::{
 use substrate_api_client::rpc::Request;
 use anyhow::anyhow;
 use chrono::{FixedOffset, Local, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use scale_value::{Composite, Primitive, Value as ScaleValue, ValueDef, Variant};
 use serde_json::Value;
 use sp_core::crypto::{AccountId32, KeyTypeId};
@@ -293,13 +294,22 @@ fn parse_output_tz(s: &str) -> anyhow::Result<OutputTz> {
 }
 
 fn format_ts(ts_ms: i64, tz: &OutputTz) -> String {
-	let dt_utc = chrono::DateTime::<Utc>::from_timestamp_millis(ts_ms).unwrap();
+	let dt_utc = chrono::DateTime::<Utc>::from_timestamp_millis(ts_ms).unwrap_or_else(|| Utc::now());
+	format_dt(dt_utc, tz)
+}
+
+fn format_dt(dt_utc: chrono::DateTime<chrono::Utc>, tz: &OutputTz) -> String {
 	match tz {
 		OutputTz::Utc => dt_utc.to_rfc3339(),
 		OutputTz::Local => dt_utc.with_timezone(&Local).to_rfc3339(),
 		OutputTz::ForcedLocal => dt_utc.with_timezone(&Local).to_rfc3339(),
 		OutputTz::Fixed(off) => dt_utc.with_timezone(off).to_rfc3339(),
 	}
+}
+
+fn parse_rfc3339_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+	let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+	Some(dt.with_timezone(&Utc))
 }
 
 #[cfg(unix)]
@@ -428,6 +438,113 @@ WHERE slot=?1
 	Ok(())
 }
 
+fn db_upsert_minted_block(
+	conn: &Connection,
+	slot: u64,
+	epoch: u64,
+	block_number: u64,
+	block_hash: &str,
+	produced_time_utc: &str,
+) -> anyhow::Result<()> {
+	// Unlike finality, mint is rare and only relevant to "our" blocks.
+	// If the schedule row is missing for any reason, we still want to record mint.
+	conn.execute(
+		r#"
+INSERT INTO blocks(slot, epoch, planned_time_utc, block_number, block_hash, produced_time_utc, status)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'mint')
+ON CONFLICT(slot) DO UPDATE SET
+  block_number=excluded.block_number,
+  block_hash=excluded.block_hash,
+  produced_time_utc=excluded.produced_time_utc,
+  status=CASE
+    WHEN blocks.status='finality' THEN blocks.status
+    WHEN blocks.status='schedule' THEN 'mint'
+    ELSE blocks.status
+  END
+"#,
+		params![
+			slot as i64,
+			epoch as i64,
+			produced_time_utc,
+			block_number as i64,
+			block_hash,
+			produced_time_utc
+		],
+	)?;
+	Ok(())
+}
+
+#[derive(Clone)]
+struct ScheduleRow {
+	slot: u64,
+	planned_time_utc: String,
+	status: String,
+	block_number: Option<u64>,
+	block_hash: Option<String>,
+	produced_time_utc: Option<String>,
+}
+
+fn db_fetch_schedule_rows(conn: &Connection, slots: &[u64]) -> anyhow::Result<Vec<ScheduleRow>> {
+	if slots.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let placeholders = std::iter::repeat("?")
+		.take(slots.len())
+		.collect::<Vec<_>>()
+		.join(",");
+	let sql = format!(
+		"SELECT slot, planned_time_utc, status, block_number, block_hash, produced_time_utc \
+		 FROM blocks WHERE slot IN ({placeholders}) ORDER BY slot ASC"
+	);
+
+	let mut stmt = conn.prepare(&sql)?;
+	let mut rows = stmt.query(params_from_iter(slots.iter().map(|s| *s as i64)))?;
+
+	let mut out: Vec<ScheduleRow> = Vec::new();
+	while let Some(row) = rows.next()? {
+		let slot: i64 = row.get(0)?;
+		let planned_time_utc: String = row.get(1)?;
+		let status: String = row.get(2)?;
+		let block_number: Option<i64> = row.get(3)?;
+		let block_hash: Option<String> = row.get(4)?;
+		let produced_time_utc: Option<String> = row.get(5)?;
+		out.push(ScheduleRow {
+			slot: slot as u64,
+			planned_time_utc,
+			status,
+			block_number: block_number.map(|n| n as u64),
+			block_hash,
+			produced_time_utc,
+		});
+	}
+	Ok(out)
+}
+
+fn schedule_rows_hash(rows: &[ScheduleRow]) -> [u8; 32] {
+	let mut hasher = Sha256::new();
+	for r in rows {
+		hasher.update(r.slot.to_le_bytes());
+		hasher.update(r.planned_time_utc.as_bytes());
+		hasher.update(b"\0");
+		hasher.update(r.status.as_bytes());
+		hasher.update(b"\0");
+		if let Some(n) = r.block_number {
+			hasher.update(n.to_le_bytes());
+		}
+		hasher.update(b"\0");
+		if let Some(ref h) = r.block_hash {
+			hasher.update(h.as_bytes());
+		}
+		hasher.update(b"\0");
+		if let Some(ref t) = r.produced_time_utc {
+			hasher.update(t.as_bytes());
+		}
+		hasher.update(b"\0");
+	}
+	hasher.finalize().into()
+}
+
 fn aura_slot_from_header(
 	header: &<DefaultRuntimeConfig as substrate_api_client::ac_primitives::config::Config>::Header,
 ) -> Option<u64> {
@@ -441,6 +558,67 @@ fn aura_slot_from_header(
 		}
 	}
 	None
+}
+
+fn authorities_at(
+	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
+	at_hash: sp_core::H256,
+) -> anyhow::Result<Vec<sr25519::Public>> {
+	let res: Option<Vec<sr25519::Public>> = api
+		.get_storage("Aura", "Authorities", Some(at_hash))
+		.map_err(|e| anyhow!("{e:?}"))?;
+	Ok(res.unwrap_or_default())
+}
+
+fn scan_new_finalized_blocks(
+	api: &Api<DefaultRuntimeConfig, TungsteniteRpcClient>,
+	conn: Option<&Connection>,
+	last_finalized_number: &mut u64,
+) -> anyhow::Result<bool> {
+	let Some(finalized_hash) = api
+		.get_finalized_head()
+		.map_err(|e| anyhow!("{e:?}"))?
+	else {
+		return Ok(false);
+	};
+	let Some(finalized_header) = api
+		.get_header(Some(finalized_hash))
+		.map_err(|e| anyhow!("{e:?}"))?
+	else {
+		return Ok(false);
+	};
+
+	let finalized_number: u64 = finalized_header.number.into();
+	if finalized_number <= *last_finalized_number {
+		return Ok(false);
+	}
+
+	// If we don't store anything, just advance the cursor to avoid repeated scans.
+	let Some(conn) = conn else {
+		*last_finalized_number = finalized_number;
+		return Ok(true);
+	};
+
+	for n in (*last_finalized_number + 1)..=finalized_number {
+		let bn_u32: u32 = n
+			.try_into()
+			.map_err(|_| anyhow!("finalized block number {n} does not fit u32"))?;
+		let Some(h) = api.get_block_hash(Some(bn_u32)).map_err(|e| anyhow!("{e:?}"))? else {
+			continue;
+		};
+		let Some(hdr) = api.get_header(Some(h)).map_err(|e| anyhow!("{e:?}"))? else {
+			continue;
+		};
+		let Some(slot) = aura_slot_from_header(&hdr) else {
+			continue;
+		};
+		let block_hash_str = format!("{h:?}");
+		let produced_time_utc = block_time_utc(api, h);
+		db_update_block_status(conn, slot, n, &block_hash_str, &produced_time_utc, "finality")?;
+	}
+
+	*last_finalized_number = finalized_number;
+	Ok(true)
 }
 
 fn block_time_utc(
@@ -611,6 +789,14 @@ fn hex_bytes_abbrev(bytes: &[u8], max_hex_chars: usize) -> String {
 		return format!("0x{h}");
 	}
 	format!("0x{}...{}", &h[..max_hex_chars], &h[h.len().saturating_sub(32)..])
+}
+
+fn status_tag(colors: &Colors, status: &str) -> String {
+	match status {
+		"finality" => format!(" {}", colors.ok("finality ✅")),
+		"mint" => format!(" {}", colors.range("mint🆕")),
+		_ => format!(" {}", colors.dim("schedule ⏰")),
+	}
 }
 
 fn extract_plain_type_id(ty_dbg: &str) -> Option<u32> {
@@ -1588,13 +1774,26 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 	let mut prev_len: usize = 0;
 	let mut prev_author_present: Option<bool> = None;
 	let mut prev_my_schedule_hash: Option<[u8; 32]> = None;
+	let mut prev_schedule_view_hash: Option<[u8; 32]> = None;
 	let mut prev_epoch: Option<u64> = None;
+	let mut cached_epoch_rows: Option<Vec<(String, String)>> = None;
+	let mut current_my_slots: Vec<u64> = Vec::new();
 	let mut pending_next_committee_print: bool = true; // also print on first render
+	let mut next_preview_printed: bool = false;
 	let mut waiting_notice_printed: bool = false;
+	let mut waiting_progress_tick: u64 = 0;
 	// Do not backfill from genesis on startup; initialize cursors from the current chain state.
-	let mut last_best_hash: Option<sp_core::H256> = api
+	let initial_best_hash: Option<sp_core::H256> = api
 		.get_block_hash(None)
 		.map_err(|e| anyhow!("{e:?}"))?;
+	let mut last_best_number: u64 = match initial_best_hash {
+		Some(h) => api
+			.get_header(Some(h))
+			.map_err(|e| anyhow!("{e:?}"))?
+			.map(|hdr| hdr.number.into())
+			.unwrap_or(0),
+		None => 0,
+	};
 	let mut last_finalized_number: u64 = match api
 		.get_finalized_head()
 		.map_err(|e| anyhow!("{e:?}"))?
@@ -1727,6 +1926,7 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 		let epoch_switched = prev_epoch.is_none() || prev_epoch.unwrap() != epoch_idx;
 		if epoch_switched {
 			pending_next_committee_print = true;
+			next_preview_printed = false;
 		}
 
 		if live_update && (changed || epoch_switched) && !screen_cleared {
@@ -1818,6 +2018,7 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 				}
 			}
 
+			cached_epoch_rows = Some(rows.clone());
 			print_kv_table(&rows);
 			println!();
 		}
@@ -1829,6 +2030,8 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 		prev_author_present = Some(author_present);
 
 				if !author_present {
+					current_my_slots.clear();
+					prev_schedule_view_hash = None;
 						if changed || author_present_changed || prev_epoch.is_none() || prev_epoch.unwrap() != epoch_idx {
 							eprintln!(
 								"{}",
@@ -1858,51 +2061,105 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 						);
 					}
 				} else {
-					let my_slots = compute_my_slots(&auths, &author_bytes, start_slot, slots_to_scan);
-					let my_hash = schedule_hash(&my_slots);
-						let my_changed = prev_my_schedule_hash.is_none() || prev_my_schedule_hash.unwrap() != my_hash;
+					current_my_slots =
+						compute_my_slots(&auths, &author_bytes, start_slot, slots_to_scan);
+					let my_hash = schedule_hash(&current_my_slots);
+					let my_changed =
+						prev_my_schedule_hash.is_none() || prev_my_schedule_hash.unwrap() != my_hash;
 					let epoch_changed = epoch_switched;
 
-							if my_changed || epoch_changed {
-								if !live_update && is_tty && waiting_notice_printed {
-									println!();
-								}
-								waiting_notice_printed = false;
-								prev_my_schedule_hash = Some(my_hash);
-								prev_epoch = Some(epoch_idx);
+					if my_changed || epoch_changed {
+						if !live_update && is_tty && waiting_notice_printed {
+							println!();
+						}
+						waiting_notice_printed = false;
+						prev_my_schedule_hash = Some(my_hash);
+						prev_epoch = Some(epoch_idx);
 
-							let mut idx: usize = 0;
-
-						if let Some(ref mut c) = conn {
-							let planned: Vec<(u64, String)> = my_slots
-								.iter()
-								.map(|slot| {
+						let planned: Vec<(u64, String)> = current_my_slots
+							.iter()
+							.map(|slot| {
 								let ts = ts_ms as i64
 									+ ((*slot as i64 - latest_slot as i64) * slot_dur_ms as i64);
 								(*slot, format_ts(ts, &utc_tz))
 							})
 							.collect();
-						db_insert_schedule(c, epoch_idx, &planned)?;
-					}
+
+						if let Some(ref mut c) = conn {
+							db_insert_schedule(c, epoch_idx, &planned)?;
+						}
+
+						let planned_by_slot: HashMap<u64, String> =
+							planned.iter().map(|(s, t)| (*s, t.clone())).collect();
+
+						let schedule_rows: Vec<ScheduleRow> = if let Some(ref c) = conn {
+							let fetched = db_fetch_schedule_rows(c, &current_my_slots)?;
+							let mut by_slot: HashMap<u64, ScheduleRow> = HashMap::new();
+							for r in fetched {
+								by_slot.insert(r.slot, r);
+							}
+							current_my_slots
+								.iter()
+								.map(|slot| {
+									by_slot.get(slot).cloned().unwrap_or_else(|| ScheduleRow {
+										slot: *slot,
+										planned_time_utc: planned_by_slot
+											.get(slot)
+											.cloned()
+											.unwrap_or_else(|| "-".to_string()),
+										status: "schedule".to_string(),
+										block_number: None,
+										block_hash: None,
+										produced_time_utc: None,
+									})
+								})
+								.collect()
+						} else {
+							current_my_slots
+								.iter()
+								.map(|slot| ScheduleRow {
+									slot: *slot,
+									planned_time_utc: planned_by_slot
+										.get(slot)
+										.cloned()
+										.unwrap_or_else(|| "-".to_string()),
+									status: "schedule".to_string(),
+									block_number: None,
+									block_hash: None,
+									produced_time_utc: None,
+								})
+								.collect()
+						};
+
+						prev_schedule_view_hash = Some(schedule_rows_hash(&schedule_rows));
+
 						println!(
 							"{}: {}",
 							i18n.pick("Current epoch Schedule", "現在のエポックのスケジュール"),
 							colors.epoch(epoch_idx.to_string())
 						);
 						println!("-------------------------");
-					for slot in &my_slots {
-						idx += 1;
-						let ts = ts_ms as i64 + ((*slot as i64 - latest_slot as i64) * slot_dur_ms as i64);
-						let out_ts = colors.time(format_ts(ts, &out_tz));
-						let utc_ts = format_ts(ts, &utc_tz);
-						println!(
-							"#{idx} slot {}: {} (UTC {})",
-							colors.slot(slot.to_string()),
-							out_ts,
-							colors.dim(utc_ts)
-						);
+								for (idx, row) in schedule_rows.iter().enumerate() {
+									let dt_utc = parse_rfc3339_utc(&row.planned_time_utc);
+									let out_ts = dt_utc
+										.map(|dt| colors.time(format_dt(dt, &out_tz)))
+								.unwrap_or_else(|| "-".to_string());
+							let utc_ts = dt_utc
+								.map(|dt| format_dt(dt, &utc_tz))
+								.unwrap_or_else(|| "-".to_string());
+
+							let status = status_tag(&colors, &row.status);
+							println!(
+								"#{idx1} slot {}: {} (UTC {}){}",
+								colors.slot(row.slot.to_string()),
+								out_ts,
+								colors.dim(utc_ts),
+								status,
+								idx1 = idx + 1
+							);
 						}
-						println!("{}={}", i18n.pick("Total", "合計"), my_slots.len());
+						println!("{}={}", i18n.pick("Total", "合計"), schedule_rows.len());
+
 						if pending_next_committee_print {
 							pending_next_committee_print = false;
 							println!();
@@ -1920,86 +2177,128 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 								&out_tz,
 								&utc_tz,
 							);
+							next_preview_printed = true;
 						}
 					}
 				}
 
-			// Mint detection (best head): when a new head appears and its slot belongs to this author.
-			if last_best_hash.map(|h| h != best_hash).unwrap_or(true) {
-				last_best_hash = Some(best_hash);
-				if let Some(slot) = aura_slot_from_header(&best_header) {
-					let expected = &auths[(slot as usize) % auths.len()];
+			// Mint detection: scan new best blocks since last check and mark blocks produced by this author.
+			// This avoids missing mint events when the tool sleeps between polls.
+			if best_number > last_best_number {
+				for n in (last_best_number + 1)..=best_number {
+					let bn_u32: u32 = n.try_into().map_err(|_| anyhow!("best block number {n} does not fit u32"))?;
+					let Some(h) = api.get_block_hash(Some(bn_u32)).map_err(|e| anyhow!("{e:?}"))? else {
+						continue;
+					};
+					let Some(hdr) = api.get_header(Some(h)).map_err(|e| anyhow!("{e:?}"))? else {
+						continue;
+					};
+					let Some(slot) = aura_slot_from_header(&hdr) else {
+						continue;
+					};
+					let auths_for_slot = authorities_at(&api, hdr.parent_hash).unwrap_or_else(|_| auths.clone());
+					if auths_for_slot.is_empty() {
+						continue;
+					}
+					let expected = &auths_for_slot[(slot as usize) % auths_for_slot.len()];
 					let expected_bytes: &[u8] = expected.as_ref();
-					if expected_bytes == author_bytes.as_slice() {
-						if let Some(ref c) = conn {
-							let block_hash_str = format!("{best_hash:?}");
-							let produced_time_utc = block_time_utc(&api, best_hash);
-							db_update_block_status(
-								c,
-								slot,
-								best_number,
-								&block_hash_str,
-								&produced_time_utc,
-								"mint",
-							)?;
-						}
+					if expected_bytes != author_bytes.as_slice() {
+						continue;
+					}
+					if let Some(ref c) = conn {
+						let block_hash_str = format!("{h:?}");
+						let produced_time_utc = block_time_utc(&api, h);
+						db_upsert_minted_block(c, slot, slot / epoch_size, n, &block_hash_str, &produced_time_utc)?;
 					}
 				}
+				last_best_number = best_number;
 			}
 
 			// Finality: scan new finalized blocks since last check and update scheduled slots.
-			if let Some(finalized_hash) = api
-				.get_finalized_head()
-				.map_err(|e| anyhow!("{e:?}"))?
-			{
-				if let Some(finalized_header) = api
-					.get_header(Some(finalized_hash))
-					.map_err(|e| anyhow!("{e:?}"))?
-				{
-					let finalized_number: u64 = finalized_header.number.into();
-					if finalized_number > last_finalized_number {
-						for n in (last_finalized_number + 1)..=finalized_number {
-							let bn_u32: u32 = n
-								.try_into()
-								.map_err(|_| anyhow!("finalized block number {n} does not fit u32"))?;
-							let Some(h) = api
-								.get_block_hash(Some(bn_u32))
-								.map_err(|e| anyhow!("{e:?}"))?
-							else {
-								continue;
-							};
-							let Some(hdr) = api.get_header(Some(h)).map_err(|e| anyhow!("{e:?}"))? else {
-								continue;
-							};
-							let Some(slot) = aura_slot_from_header(&hdr) else {
-								continue;
-							};
-							if let Some(ref c) = conn {
-								let block_hash_str = format!("{h:?}");
-								let produced_time_utc = block_time_utc(&api, h);
-								db_update_block_status(
-									c,
-									slot,
-									n,
-									&block_hash_str,
-									&produced_time_utc,
-									"finality",
-								)?;
+			let _ = scan_new_finalized_blocks(&api, conn.as_ref(), &mut last_finalized_number)?;
+
+				// Watch SQLite schedule status changes and refresh the displayed schedule.
+				if author_present && !current_my_slots.is_empty() {
+					if let Some(ref c) = conn {
+						let schedule_rows = db_fetch_schedule_rows(c, &current_my_slots)?;
+						let new_hash = schedule_rows_hash(&schedule_rows);
+						let changed = prev_schedule_view_hash.map(|h| h != new_hash).unwrap_or(true);
+						if changed {
+							prev_schedule_view_hash = Some(new_hash);
+							waiting_notice_printed = false;
+							if live_update {
+								print!("\r\x1b[2K\x1b[2J\x1b[H{banner}");
+								let _ = std::io::stdout().flush();
+
+								let paren = format!(
+									"({}:{} / {}:{})",
+									i18n.pick("start_slot", "開始スロット"),
+									start_slot,
+									i18n.pick("end_slot", "終了スロット"),
+									epoch_end_slot
+								);
+								println!(
+									"{}:{} {}",
+									i18n.pick("epoch", "エポック"),
+									colors.epoch(epoch_idx.to_string()),
+									colors.dim(paren)
+								);
+								if let Some(ref rows) = cached_epoch_rows {
+									print_kv_table(rows);
+									println!();
+								}
+							}
+
+							println!(
+								"{}: {}",
+								i18n.pick("Current epoch Schedule", "現在のエポックのスケジュール"),
+								colors.epoch(epoch_idx.to_string())
+							);
+							println!("-------------------------");
+							for (idx, row) in schedule_rows.iter().enumerate() {
+								let dt_utc = parse_rfc3339_utc(&row.planned_time_utc);
+								let out_ts = dt_utc
+									.map(|dt| colors.time(format_dt(dt, &out_tz)))
+									.unwrap_or_else(|| "-".to_string());
+								let utc_ts = dt_utc
+									.map(|dt| format_dt(dt, &utc_tz))
+									.unwrap_or_else(|| "-".to_string());
+
+								let status = status_tag(&colors, &row.status);
+								println!(
+									"#{idx1} slot {}: {} (UTC {}){}",
+									colors.slot(row.slot.to_string()),
+									out_ts,
+									colors.dim(utc_ts),
+									status,
+										idx1 = idx + 1
+									);
+								}
+								println!("{}={}", i18n.pick("Total", "合計"), schedule_rows.len());
+
+								if live_update && next_preview_printed {
+									println!();
+									let next_start_slot = (epoch_idx + 1) * epoch_size;
+									print_next_committee_for_author(
+										&i18n,
+										&colors,
+										&api,
+										&author_bytes,
+										latest_slot,
+										ts_ms,
+										slot_dur_ms,
+										next_start_slot,
+										&out_tz,
+										&utc_tz,
+									);
+								}
 							}
 						}
-						last_finalized_number = finalized_number;
 					}
+
+				if !common.watch {
+					break;
 				}
-			}
-
-			if !common.watch {
-				break;
-			}
-
-			let next_epoch_start_slot = (epoch_idx + 1) * epoch_size;
-			let delta_slots = next_epoch_start_slot.saturating_sub(latest_slot).max(1);
-			let delta_ms = delta_slots.saturating_mul(slot_dur_ms);
-			let remaining_secs = (delta_ms / 1000).max(1);
 
 			if !waiting_notice_printed {
 				waiting_notice_printed = true;
@@ -2011,31 +2310,26 @@ fn run(common: CommonArgs) -> anyhow::Result<()> {
 				);
 			}
 
-			// Avoid sleeping for very long periods so we can still react if the node stalls.
-			let sleep_secs = remaining_secs.min(600).max(1);
+			// Poll the chain once per slot (approx 1s) so mint/finality updates are not delayed.
 			if is_tty {
-				// Update progress line in realtime without extra RPC calls.
-				let slot_dur_ms = slot_dur_ms.max(1);
-				for elapsed in 0..sleep_secs {
-					let est_slot = latest_slot.saturating_add((elapsed * 1000) / slot_dur_ms);
-					let cur = est_slot.saturating_sub(start_slot);
-					let denom = epoch_size.max(1);
-					let pct = ((cur.saturating_mul(100)) / denom).min(100) as u8;
-					// Always redraw once per second so the current slot display advances even if the percentage doesn't.
+				let cur = latest_slot.saturating_sub(start_slot);
+				let denom = epoch_size.max(1);
+				let pct = ((cur.saturating_mul(100)) / denom).min(100) as u8;
+				if waiting_progress_tick % 5 == 0 {
 					print_progress(
 						true,
 						&colors,
 						i18n.pick("progress", "進捗"),
 						pct,
-						est_slot,
+						latest_slot,
 						epoch_end_slot,
 					);
-					std::thread::sleep(Duration::from_secs(1));
 				}
-			} else {
-				// Non-TTY: keep logs clean, and avoid extra CPU usage.
-				std::thread::sleep(Duration::from_secs(sleep_secs));
 			}
+
+			waiting_progress_tick = waiting_progress_tick.wrapping_add(1);
+			std::thread::sleep(Duration::from_secs(1));
+			continue;
 		}
 
 	Ok(())
